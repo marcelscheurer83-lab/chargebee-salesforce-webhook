@@ -1,0 +1,50 @@
+# Run Chargebee → Google Sheet sync at end of day (UTC).
+# Does not depend on your machine; runs in GitHub's cloud.
+#
+# Setup:
+# 1. Push this repo to GitHub (public or private).
+# 2. In the repo: Settings → Secrets and variables → Actions → New repository secret.
+#    Add:
+#    - CHARGEBEE_SITE       (e.g. dazos)
+#    - CHARGEBEE_API_KEY   (your Chargebee API key)
+#    - GOOGLE_SHEET_ID     (the spreadsheet ID from the sheet URL)
+#    - GOOGLE_CREDENTIALS_JSON  (entire contents of your service account .json file, as one secret)
+# 3. This workflow runs daily at 23:55 UTC (adjust schedule below if needed).
+name: Daily Chargebee sync
+
+on:
+  schedule:
+    # 23:55 UTC daily (adjust cron to your "end of day" in UTC)
+    - cron: '55 23 * * *'
+  workflow_dispatch: # allow manual run from Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create .env and credentials
+        env:
+          CHARGEBEE_SITE: ${{ secrets.CHARGEBEE_SITE }}
+          CHARGEBEE_API_KEY: ${{ secrets.CHARGEBEE_API_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p .env.d
+          echo "CHARGEBEE_SITE=$CHARGEBEE_SITE" >> .env
+          echo "CHARGEBEE_API_KEY=$CHARGEBEE_API_KEY" >> .env
+          echo "GOOGLE_SHEET_ID=$GOOGLE_SHEET_ID" >> .env
+          echo "GOOGLE_CREDENTIALS_PATH=./chargebee-sa.json" >> .env
+          echo "$GOOGLE_CREDENTIALS_JSON" > chargebee-sa.json
+
+      - name: Run sync
+        run: python sync_to_sheet.py
