@@ -431,7 +431,7 @@ def _attach_opportunity_line_items(
     contract_end: date | None,
     term_months: int | None,
 ) -> None:
-    """One OpportunityLineItem per Chargebee line in pending (delta qty, UnitPrice from Chargebee)."""
+    """One OpportunityLineItem per Chargebee line. Quantity: delta (default) or total (SF_OLI_QUANTITY_MODE)."""
     resolved = _resolve_pricebook_entry(sf)
     if not resolved:
         return
@@ -445,14 +445,16 @@ def _attach_opportunity_line_items(
     oli_start_f = (os.getenv("SF_OLI_START_DATE_FIELD") or "").strip()
     oli_end_f = (os.getenv("SF_OLI_END_DATE_FIELD") or "").strip()
     oli_term_f = (os.getenv("SF_OLI_TERM_MONTHS_FIELD") or "").strip()
+    qty_mode = (os.getenv("SF_OLI_QUANTITY_MODE") or "delta").strip().lower()
 
     for _key, _new_qty, delta, ip_id, up in pending:
         if delta <= 0:
             continue
+        oli_qty = float(_new_qty) if qty_mode == "total" else float(delta)
         body: dict[str, Any] = {
             "OpportunityId": opp_id,
             "PricebookEntryId": pbe_id,
-            "Quantity": delta,
+            "Quantity": oli_qty,
         }
         if up is not None:
             body["UnitPrice"] = round(up, 2)
@@ -464,7 +466,14 @@ def _attach_opportunity_line_items(
             body[oli_term_f] = float(term_months)
         try:
             sf.OpportunityLineItem.create(body)
-            log.info("Added OpportunityLineItem opp=%s qty=%s unit_price=%s item_price_id=%s", opp_id, delta, up, ip_id)
+            log.info(
+                "Added OpportunityLineItem opp=%s qty=%s (%s) unit_price=%s item_price_id=%s",
+                opp_id,
+                oli_qty,
+                qty_mode,
+                up,
+                ip_id,
+            )
         except Exception:
             log.exception("OpportunityLineItem create failed item_price_id=%s", ip_id)
 
