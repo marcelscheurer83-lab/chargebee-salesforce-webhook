@@ -595,8 +595,8 @@ def _add_quote_line_items(
     contract_end: date | None,
     term_months: int | None,
 ) -> None:
-    """One QuoteLineItem per Chargebee line (same qty rules as OpportunityLineItem)."""
-    qty_mode = (os.getenv("SF_OLI_QUANTITY_MODE") or "delta").strip().lower()
+    """One QuoteLineItem per Chargebee line. Quantity: SF_QUOTE_LINE_QUANTITY_MODE (default delta), not SF_OLI_QUANTITY_MODE."""
+    qty_mode = (os.getenv("SF_QUOTE_LINE_QUANTITY_MODE") or "delta").strip().lower()
     extras = _product_line_custom_fields(
         sync_date=sync_date, contract_end=contract_end, term_months=term_months
     )
