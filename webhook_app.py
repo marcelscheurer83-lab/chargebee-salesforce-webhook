@@ -20,6 +20,9 @@ If a subscription line has no stored quantity yet, we treat the prior quantity a
 first seats added (e.g. 0→1) create an Opportunity. Run seed_webhook_state (or POST /admin/seed-state)
 so existing high quantities in Chargebee are in state before go-live—otherwise the first webhook
 after deploy could count the full current qty as "new" seats.
+
+Products: by default adds OpportunityLineItems. Set SF_USE_QUOTE_FOR_PRODUCTS=1 to create a Quote
+on the expansion Opportunity and add QuoteLineItems instead (standard Salesforce Quotes).
 """
 
 from __future__ import annotations
@@ -334,7 +337,7 @@ def _create_expansion_opportunity(
     term_f = (os.getenv("SF_OPP_TERM_MONTHS_FIELD") or "").strip()
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         body[term_f] = float(term_months)
-    # MRR is set after OpportunityLineItem rows (many orgs use formulas or validation tied to products).
+    # MRR is set after OpportunityLineItem / QuoteLineItem rows (many orgs use formulas tied to products).
     if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
         mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
         if mrr_f and _valid_sf_field_api_name(mrr_f) and amount is not None:
@@ -442,9 +445,109 @@ def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
     return str(recs[0]["Id"]), str(recs[0]["Pricebook2Id"])
 
 
-def _attach_opportunity_line_items(
+def _ensure_opportunity_pricebook(sf: Salesforce, opp_id: str, pb2_id: str) -> bool:
+    try:
+        sf.Opportunity.update(opp_id, {"Pricebook2Id": pb2_id})
+        return True
+    except Exception:
+        log.exception("Could not set Opportunity Pricebook2Id")
+        return False
+
+
+def _product_line_custom_fields(
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
+) -> dict[str, Any]:
+    """Shared custom fields for OpportunityLineItem and QuoteLineItem (same API names on both objects)."""
+    out: dict[str, Any] = {}
+    start_f = (os.getenv("SF_OLI_START_DATE_FIELD") or "").strip()
+    end_f = (os.getenv("SF_OLI_END_DATE_FIELD") or "").strip()
+    term_f = (os.getenv("SF_OLI_TERM_MONTHS_FIELD") or "").strip()
+    if start_f and _valid_sf_field_api_name(start_f):
+        out[start_f] = _sf_date_payload(sync_date)
+    if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
+        out[end_f] = _sf_date_payload(contract_end)
+    if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
+        out[term_f] = float(term_months)
+    return out
+
+
+def _create_expansion_quote(
     sf: Salesforce,
     opp_id: str,
+    *,
+    company: str,
+    total_seat_delta: int,
+    pb2_id: str,
+) -> str | None:
+    tmpl = (os.getenv("SF_QUOTE_NAME_TEMPLATE") or "Expansion quote (+{delta} CRM self-serve seats)").strip()
+    try:
+        name = tmpl.format(delta=total_seat_delta, company=company or "")[:255]
+    except (KeyError, ValueError, IndexError):
+        name = tmpl[:255]
+    body: dict[str, Any] = {
+        "OpportunityId": opp_id,
+        "Name": name,
+        "Pricebook2Id": pb2_id,
+        "Status": (os.getenv("SF_QUOTE_STATUS") or "Draft").strip(),
+    }
+    qc = (os.getenv("SF_QUOTE_CONTACT_ID") or "").strip()
+    if qc:
+        body["ContactId"] = qc
+    exp_raw = (os.getenv("SF_QUOTE_EXPIRATION_DAYS") or "").strip()
+    if exp_raw.isdigit():
+        body["ExpirationDate"] = (date.today() + timedelta(days=int(exp_raw))).isoformat()
+
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            result = sf.Quote.create(body)
+            qid = result.get("id")
+            if not qid:
+                raise RuntimeError(f"Salesforce Quote.create unexpected response: {result}")
+            log.info("Created Quote %s on Opportunity %s", qid, opp_id)
+            return str(qid)
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                _log_salesforce_failure("Quote.create", exc, body)
+                return None
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                _log_salesforce_failure("Quote.create", exc, body)
+                return None
+            if code != 400:
+                _log_salesforce_failure("Quote.create", exc, body)
+                return None
+            drop = _invalid_field_names_from_salesforce(exc)
+            if not drop:
+                _log_salesforce_failure("Quote.create", exc, body)
+                return None
+            removed = False
+            for f in drop:
+                if f in body:
+                    body.pop(f)
+                    removed = True
+            if not removed:
+                _log_salesforce_failure("Quote.create", exc, body)
+                return None
+            log.warning(
+                "Retrying Quote.create without non-writable fields (grant FLS or map a writable field): %s",
+                drop,
+            )
+    if last_exc:
+        _log_salesforce_failure("Quote.create", last_exc, body)
+    return None
+
+
+def _add_opportunity_line_items(
+    sf: Salesforce,
+    opp_id: str,
+    pbe_id: str,
     pending: list[tuple[str, int, int, str, float | None]],
     *,
     sync_date: date,
@@ -452,21 +555,10 @@ def _attach_opportunity_line_items(
     term_months: int | None,
 ) -> None:
     """One OpportunityLineItem per Chargebee line. Quantity: delta (default) or total (SF_OLI_QUANTITY_MODE)."""
-    resolved = _resolve_pricebook_entry(sf)
-    if not resolved:
-        return
-    pbe_id, pb2_id = resolved
-    try:
-        sf.Opportunity.update(opp_id, {"Pricebook2Id": pb2_id})
-    except Exception:
-        log.exception("Could not set Opportunity Pricebook2Id")
-        return
-
-    oli_start_f = (os.getenv("SF_OLI_START_DATE_FIELD") or "").strip()
-    oli_end_f = (os.getenv("SF_OLI_END_DATE_FIELD") or "").strip()
-    oli_term_f = (os.getenv("SF_OLI_TERM_MONTHS_FIELD") or "").strip()
     qty_mode = (os.getenv("SF_OLI_QUANTITY_MODE") or "delta").strip().lower()
-
+    extras = _product_line_custom_fields(
+        sync_date=sync_date, contract_end=contract_end, term_months=term_months
+    )
     for _key, _new_qty, delta, ip_id, up in pending:
         if delta <= 0:
             continue
@@ -475,15 +567,10 @@ def _attach_opportunity_line_items(
             "OpportunityId": opp_id,
             "PricebookEntryId": pbe_id,
             "Quantity": oli_qty,
+            **extras,
         }
         if up is not None:
             body["UnitPrice"] = round(up, 2)
-        if oli_start_f and _valid_sf_field_api_name(oli_start_f):
-            body[oli_start_f] = _sf_date_payload(sync_date)
-        if oli_end_f and _valid_sf_field_api_name(oli_end_f) and contract_end is not None:
-            body[oli_end_f] = _sf_date_payload(contract_end)
-        if oli_term_f and _valid_sf_field_api_name(oli_term_f) and term_months is not None:
-            body[oli_term_f] = float(term_months)
         try:
             sf.OpportunityLineItem.create(body)
             log.info(
@@ -496,6 +583,101 @@ def _attach_opportunity_line_items(
             )
         except Exception:
             log.exception("OpportunityLineItem create failed item_price_id=%s", ip_id)
+
+
+def _add_quote_line_items(
+    sf: Salesforce,
+    quote_id: str,
+    pbe_id: str,
+    pending: list[tuple[str, int, int, str, float | None]],
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
+) -> None:
+    """One QuoteLineItem per Chargebee line (same qty rules as OpportunityLineItem)."""
+    qty_mode = (os.getenv("SF_OLI_QUANTITY_MODE") or "delta").strip().lower()
+    extras = _product_line_custom_fields(
+        sync_date=sync_date, contract_end=contract_end, term_months=term_months
+    )
+    for _key, _new_qty, delta, ip_id, up in pending:
+        if delta <= 0:
+            continue
+        qli_qty = float(_new_qty) if qty_mode == "total" else float(delta)
+        body: dict[str, Any] = {
+            "QuoteId": quote_id,
+            "PricebookEntryId": pbe_id,
+            "Quantity": qli_qty,
+            **extras,
+        }
+        if up is not None:
+            body["UnitPrice"] = round(up, 2)
+        try:
+            sf.QuoteLineItem.create(body)
+            log.info(
+                "Added QuoteLineItem quote=%s qty=%s (%s) unit_price=%s item_price_id=%s",
+                quote_id,
+                qli_qty,
+                qty_mode,
+                up,
+                ip_id,
+            )
+        except Exception:
+            log.exception("QuoteLineItem create failed item_price_id=%s", ip_id)
+
+
+def _attach_expansion_products(
+    sf: Salesforce,
+    opp_id: str,
+    *,
+    company: str,
+    total_seat_delta: int,
+    pending: list[tuple[str, int, int, str, float | None]],
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
+) -> None:
+    """Attach products as OpportunityLineItems, or as a Quote + QuoteLineItems if SF_USE_QUOTE_FOR_PRODUCTS=1."""
+    resolved = _resolve_pricebook_entry(sf)
+    if not resolved:
+        return
+    pbe_id, pb2_id = resolved
+    if not _ensure_opportunity_pricebook(sf, opp_id, pb2_id):
+        return
+    use_quote = (os.getenv("SF_USE_QUOTE_FOR_PRODUCTS", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if use_quote:
+        qid = _create_expansion_quote(
+            sf,
+            opp_id,
+            company=company,
+            total_seat_delta=total_seat_delta,
+            pb2_id=pb2_id,
+        )
+        if not qid:
+            return
+        _add_quote_line_items(
+            sf,
+            qid,
+            pbe_id,
+            pending,
+            sync_date=sync_date,
+            contract_end=contract_end,
+            term_months=term_months,
+        )
+    else:
+        _add_opportunity_line_items(
+            sf,
+            opp_id,
+            pbe_id,
+            pending,
+            sync_date=sync_date,
+            contract_end=contract_end,
+            term_months=term_months,
+        )
 
 
 def _check_basic_auth() -> bool:
@@ -621,10 +803,12 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     term_months=term_months,
                 )
                 log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
-                _attach_opportunity_line_items(
+                _attach_expansion_products(
                     sf,
                     oid,
-                    pending,
+                    company=company or customer_id,
+                    total_seat_delta=total_delta,
+                    pending=pending,
                     sync_date=sync_date,
                     contract_end=contract_end,
                     term_months=term_months,
