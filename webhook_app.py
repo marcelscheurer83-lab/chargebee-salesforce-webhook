@@ -171,17 +171,27 @@ def _months_between_start_and_end(start: date, end: date) -> int:
     return max(0, (end.year - start.year) * 12 + (end.month - start.month))
 
 
-def _query_open_renewal_contract_end(sf: Salesforce, account_id: str) -> date | None:
-    """Contract end date from the newest open Renewal Opportunity on this Account."""
+def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) -> date | None:
+    """
+    Value for the expansion Opportunity's contract end date field.
+
+    Default: one day before Contract Start on the newest open Renewal Opportunity on this Account.
+    If SF_RENEWAL_CONTRACT_START_DATE_FIELD is unset but SF_RENEWAL_CONTRACT_END_DATE_FIELD is set,
+    falls back to that renewal end date (legacy).
+    """
+    start_field = (os.getenv("SF_RENEWAL_CONTRACT_START_DATE_FIELD") or "").strip()
     end_field = (os.getenv("SF_RENEWAL_CONTRACT_END_DATE_FIELD") or "").strip()
-    if not end_field or not _valid_sf_field_api_name(end_field):
+    use_start = bool(start_field and _valid_sf_field_api_name(start_field))
+    use_end = bool(not use_start and end_field and _valid_sf_field_api_name(end_field))
+    if not use_start and not use_end:
         return None
+    select_field = start_field if use_start else end_field
     rt_dev = (os.getenv("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME") or "Renewal").strip()
     if not rt_dev or not _valid_sf_field_api_name(rt_dev):
         return None
     safe_acc = _soql_escape(account_id)
     q = (
-        f"SELECT {end_field} FROM Opportunity WHERE AccountId = '{safe_acc}' "
+        f"SELECT {select_field} FROM Opportunity WHERE AccountId = '{safe_acc}' "
         f"AND RecordType.DeveloperName = '{_soql_escape(rt_dev)}' AND IsClosed = false "
         "ORDER BY CloseDate DESC LIMIT 1"
     )
@@ -194,7 +204,17 @@ def _query_open_renewal_contract_end(sf: Salesforce, account_id: str) -> date | 
     if not recs:
         log.warning("No open Renewal Opportunity for Account %s (RecordType %s)", account_id, rt_dev)
         return None
-    return _parse_sf_date(recs[0].get(end_field))
+    raw = _parse_sf_date(recs[0].get(select_field))
+    if raw is None:
+        log.warning(
+            "Open Renewal for Account %s missing or invalid %s",
+            account_id,
+            select_field,
+        )
+        return None
+    if use_start:
+        return raw - timedelta(days=1)
+    return raw
 
 
 def _get_salesforce() -> Salesforce:
@@ -582,7 +602,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 if any_price:
                     amount = amt_sum
                 desc = "\n".join(parts)
-                contract_end = _query_open_renewal_contract_end(sf, account_id)
+                contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
                 term_months: int | None = None
                 if contract_end is not None:
                     term_months = _months_between_start_and_end(sync_date, contract_end)
