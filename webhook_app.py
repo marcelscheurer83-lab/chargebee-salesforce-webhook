@@ -83,7 +83,13 @@ def _get_salesforce() -> Salesforce:
     domain = (os.getenv("SF_DOMAIN") or "login").strip()
     if not username or not password:
         raise ValueError("Set SF_USERNAME and SF_PASSWORD in .env (and SF_SECURITY_TOKEN if required).")
-    return Salesforce(username=username, password=password + token, domain=domain)
+    # simple_salesforce requires security_token as its own arg (use "" if login IP is trusted / no token).
+    return Salesforce(
+        username=username,
+        password=password,
+        security_token=token,
+        domain=domain,
+    )
 
 
 def _resolve_account_id(sf: Salesforce, customer: dict[str, Any], customer_id: str) -> str | None:
