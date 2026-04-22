@@ -13,8 +13,8 @@ Chargebee: Settings → Configure Chargebee → Webhooks
 State file WEBHOOK_STATE_PATH defaults to ./webhook_state.json inside the container; use a volume
 if you need quantities to survive redeploys (otherwise the next event re-baselines without an opp).
 
-Run `python seed_webhook_state.py` (with Chargebee API env vars) to load current quantities from
-Chargebee so the first webhook after seed is a real delta, not a silent baseline.
+Run `python seed_webhook_state.py` (with Chargebee API env vars) or POST `/admin/seed-state` with
+header `X-Seed-Secret` (= `WEBHOOK_SEED_SECRET`) to merge current Chargebee quantities into state.
 
 First time we see a subscription line we only record quantity (no Opportunity).
 When quantity increases, we create one Opportunity per webhook (seat increases aggregated).
@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, jsonify, request
 from simple_salesforce import Salesforce
 
 from chargebee_client import (
@@ -39,6 +39,7 @@ from chargebee_client import (
     _crm_addon_line_matches,
     self_service_line_state_key,
 )
+from seed_webhook_state import merge_chargebee_into_state_file
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -407,6 +408,26 @@ def chargebee_webhook():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.post("/admin/seed-state")
+def admin_seed_state():
+    """Merge Chargebee line quantities into webhook state (same as seed_webhook_state.py)."""
+    secret = (os.getenv("WEBHOOK_SEED_SECRET") or "").strip()
+    if not secret:
+        return "", 404
+    if (request.headers.get("X-Seed-Secret") or "").strip() != secret:
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        with _state_lock:
+            n = merge_chargebee_into_state_file(_STATE_PATH)
+    except ValueError as e:
+        log.warning("Seed failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception:
+        log.exception("admin seed failed")
+        return jsonify({"ok": False, "error": "internal"}), 500
+    return jsonify({"ok": True, "seeded_lines": n}), 200
 
 
 def main() -> None:
