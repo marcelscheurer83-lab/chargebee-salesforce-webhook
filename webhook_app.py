@@ -514,6 +514,78 @@ def _product_line_custom_fields(
     return out
 
 
+def _sf_quote_autorenew_payload() -> Any | None:
+    raw = (os.getenv("SF_QUOTE_AUTORENEW_VALUE") or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    if low in ("1", "true", "yes"):
+        return True
+    if low in ("0", "false", "no"):
+        return False
+    return raw
+
+
+def _merge_quote_header_custom_fields(
+    body: dict[str, Any],
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
+    amount: float | None,
+) -> None:
+    """Map org-specific Quote fields (contract dates, term, autorenew, MRR/ARR from seat-delta total)."""
+    start_f = (os.getenv("SF_QUOTE_CONTRACT_START_DATE_FIELD") or "").strip()
+    if start_f and _valid_sf_field_api_name(start_f):
+        body[start_f] = _sf_date_payload(sync_date)
+    end_f = (os.getenv("SF_QUOTE_CONTRACT_END_DATE_FIELD") or "").strip()
+    if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
+        body[end_f] = _sf_date_payload(contract_end)
+    term_f = (os.getenv("SF_QUOTE_TERM_MONTHS_FIELD") or "").strip()
+    if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
+        body[term_f] = float(term_months)
+    ar_f = (os.getenv("SF_QUOTE_AUTORENEW_FIELD") or "").strip()
+    if ar_f and _valid_sf_field_api_name(ar_f):
+        ar_v = _sf_quote_autorenew_payload()
+        if ar_v is not None:
+            body[ar_f] = ar_v
+    if amount is not None:
+        mrr_f = (os.getenv("SF_QUOTE_MRR_FIELD") or "").strip()
+        if mrr_f and _valid_sf_field_api_name(mrr_f):
+            body[mrr_f] = round(float(amount), 2)
+        arr_f = (os.getenv("SF_QUOTE_ARR_FIELD") or "").strip()
+        if arr_f and _valid_sf_field_api_name(arr_f):
+            body[arr_f] = round(float(amount) * 12.0, 2)
+
+
+def _try_set_quote_syncing(sf: Salesforce, quote_id: str) -> None:
+    """
+    Standard Salesforce Quote: set IsSyncing so line items sync to Opportunity products.
+    If your org uses a custom checkbox instead, set SF_QUOTE_SYNCING_FIELD (and optional SF_QUOTE_SYNCING_VALUE).
+    Salesforce CPQ (SBQQ__Quote__c) uses a different model — this applies to standard Quote only.
+    """
+    if (os.getenv("SF_QUOTE_SYNC_TO_OPPORTUNITY", "1") or "").strip().lower() in ("0", "false", "no"):
+        return
+    alt = (os.getenv("SF_QUOTE_SYNCING_FIELD") or "").strip()
+    if alt and _valid_sf_field_api_name(alt):
+        vraw = (os.getenv("SF_QUOTE_SYNCING_VALUE") or "true").strip()
+        low = vraw.lower()
+        if low in ("1", "true", "yes"):
+            val: Any = True
+        elif low in ("0", "false", "no"):
+            val = False
+        else:
+            val = vraw
+        patch: dict[str, Any] = {alt: val}
+    else:
+        patch = {"IsSyncing": True}
+    try:
+        sf.Quote.update(quote_id, patch)
+        log.info("Quote → Opportunity sync flag set for %s (%s)", quote_id, list(patch.keys()))
+    except Exception as exc:
+        log.warning("Could not set quote sync (%s): %s", patch, exc)
+
+
 def _create_expansion_quote(
     sf: Salesforce,
     opp_id: str,
@@ -521,6 +593,10 @@ def _create_expansion_quote(
     company: str,
     total_seat_delta: int,
     pb2_id: str,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
+    amount: float | None,
 ) -> str | None:
     tmpl = (os.getenv("SF_QUOTE_NAME_TEMPLATE") or "Expansion quote (+{delta} CRM self-serve seats)").strip()
     try:
@@ -536,9 +612,19 @@ def _create_expansion_quote(
     qc = (os.getenv("SF_QUOTE_CONTACT_ID") or "").strip()
     if qc:
         body["ContactId"] = qc
-    exp_raw = (os.getenv("SF_QUOTE_EXPIRATION_DAYS") or "").strip()
-    if exp_raw.isdigit():
-        body["ExpirationDate"] = (date.today() + timedelta(days=int(exp_raw))).isoformat()
+    exp_raw = (os.getenv("SF_QUOTE_EXPIRATION_DAYS") or "30").strip() or "30"
+    try:
+        exp_days = max(1, int(exp_raw))
+    except ValueError:
+        exp_days = 30
+    body["ExpirationDate"] = (date.today() + timedelta(days=exp_days)).isoformat()
+    _merge_quote_header_custom_fields(
+        body,
+        sync_date=sync_date,
+        contract_end=contract_end,
+        term_months=term_months,
+        amount=amount,
+    )
 
     last_exc: BaseException | None = None
     for _attempt in range(8):
@@ -610,6 +696,13 @@ def _add_quote_line_items(
         }
         if up is not None:
             body["UnitPrice"] = round(up, 2)
+            line_mrr = round(float(up) * float(delta), 2)
+            lm = (os.getenv("SF_QTI_MRR_FIELD") or "").strip()
+            if lm and _valid_sf_field_api_name(lm):
+                body[lm] = line_mrr
+            la = (os.getenv("SF_QTI_ARR_FIELD") or "").strip()
+            if la and _valid_sf_field_api_name(la):
+                body[la] = round(line_mrr * 12.0, 2)
         try:
             sf.QuoteLineItem.create(body)
             log.info(
@@ -633,6 +726,7 @@ def _attach_expansion_quote_and_lines(
     sync_date: date,
     contract_end: date | None,
     term_months: int | None,
+    amount: float | None,
 ) -> None:
     """Create Quote on Opportunity and add QuoteLineItems (seat deltas)."""
     resolved = _resolve_pricebook_entry(sf)
@@ -647,6 +741,10 @@ def _attach_expansion_quote_and_lines(
         company=company,
         total_seat_delta=total_seat_delta,
         pb2_id=pb2_id,
+        sync_date=sync_date,
+        contract_end=contract_end,
+        term_months=term_months,
+        amount=amount,
     )
     if not qid:
         return
@@ -659,6 +757,7 @@ def _attach_expansion_quote_and_lines(
         contract_end=contract_end,
         term_months=term_months,
     )
+    _try_set_quote_syncing(sf, qid)
 
 
 def _check_basic_auth() -> bool:
@@ -790,6 +889,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     sync_date=sync_date,
                     contract_end=contract_end,
                     term_months=term_months,
+                    amount=amount,
                 )
                 _update_opportunity_mrr_after_products(sf, oid, amount)
             else:
