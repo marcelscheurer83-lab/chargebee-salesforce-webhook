@@ -116,6 +116,60 @@ def get_client() -> Chargebee:
     return Chargebee(api_key=api_key, site=site)
 
 
+def self_service_line_state_key(subscription_id: str, item_price_id: str) -> str:
+    """Stable key for webhook state: one entry per subscription line (matches webhook_app)."""
+    return f"{subscription_id}|{item_price_id}"
+
+
+def fetch_self_service_line_quantities(
+    client: Chargebee | None = None,
+    item_price_ids: list[str] | None = None,
+) -> dict[str, int]:
+    """
+    Current quantities for all CRM self-service add-on lines on active subscriptions.
+    Keys match webhook state (subscription_id|item_price_id). Use to seed baselines before
+    relying on webhooks (run seed_webhook_state.py on deploy or on a schedule).
+    """
+    if client is None:
+        client = get_client()
+    exact: frozenset[str] | None
+    if item_price_ids is not None and len(item_price_ids) > 0:
+        exact = frozenset(item_price_ids)
+    else:
+        exact = _addon_exact_ids_from_env()
+
+    out: dict[str, int] = {}
+    next_offset = None
+    while True:
+        params: dict = {"status": {"IS": "active"}}
+        if next_offset is not None:
+            params["offset"] = next_offset
+        response = client.Subscription.list(params)
+        for list_item in response.list:
+            sub = list_item.subscription
+            sid = getattr(sub, "id", None)
+            if not sid:
+                continue
+            items = getattr(sub, "subscription_items", None) or []
+            for si in items:
+                if si is None:
+                    continue
+                ip_id = getattr(si, "item_price_id", None)
+                itype = getattr(si, "item_type", None)
+                if not _crm_addon_line_matches(ip_id, itype, exact):
+                    continue
+                qty = getattr(si, "quantity", None)
+                try:
+                    q = int(qty) if qty is not None else 0
+                except (TypeError, ValueError):
+                    q = 0
+                out[self_service_line_state_key(str(sid), str(ip_id))] = q
+        next_offset = getattr(response, "next_offset", None)
+        if not next_offset:
+            break
+    return out
+
+
 def fetch_customers_with_addons(
     client: Chargebee | None = None,
     item_price_ids: list[str] | None = None,

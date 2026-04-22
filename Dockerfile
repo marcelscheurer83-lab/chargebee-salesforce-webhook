@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY webhook_app.py chargebee_client.py ./
+COPY webhook_app.py chargebee_client.py seed_webhook_state.py ./
 
 ENV PORT=8080
 EXPOSE 8080

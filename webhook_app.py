@@ -13,6 +13,9 @@ Chargebee: Settings → Configure Chargebee → Webhooks
 State file WEBHOOK_STATE_PATH defaults to ./webhook_state.json inside the container; use a volume
 if you need quantities to survive redeploys (otherwise the next event re-baselines without an opp).
 
+Run `python seed_webhook_state.py` (with Chargebee API env vars) to load current quantities from
+Chargebee so the first webhook after seed is a real delta, not a silent baseline.
+
 First time we see a subscription line we only record quantity (no Opportunity).
 When quantity increases, we create one Opportunity per webhook (seat increases aggregated).
 """
@@ -31,7 +34,11 @@ from dotenv import load_dotenv
 from flask import Flask, request
 from simple_salesforce import Salesforce
 
-from chargebee_client import _addon_exact_ids_from_env, _crm_addon_line_matches
+from chargebee_client import (
+    _addon_exact_ids_from_env,
+    _crm_addon_line_matches,
+    self_service_line_state_key,
+)
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -66,10 +73,6 @@ def _trim_processed_ids(ids: list[str], max_keep: int = 2000) -> list[str]:
     if len(ids) > max_keep:
         return ids[-max_keep:]
     return ids
-
-
-def _line_key(sub_id: str, item_price_id: str) -> str:
-    return f"{sub_id}|{item_price_id}"
 
 
 def _soql_escape(value: str) -> str:
@@ -180,6 +183,76 @@ def _create_expansion_opportunity(
     return str(oid)
 
 
+def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
+    """Return (PricebookEntryId, Pricebook2Id) for OpportunityLineItem rows."""
+    pbe_env = (os.getenv("SF_PRICEBOOK_ENTRY_ID") or "").strip()
+    if pbe_env:
+        res = sf.query(
+            "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Id = "
+            f"'{_soql_escape(pbe_env)}' LIMIT 1"
+        )
+        recs = res.get("records") or []
+        if recs:
+            return str(recs[0]["Id"]), str(recs[0]["Pricebook2Id"])
+        log.warning("SF_PRICEBOOK_ENTRY_ID not found")
+        return None
+
+    prod2 = (os.getenv("SF_PRODUCT2_ID") or "").strip()
+    if prod2:
+        q = (
+            "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Product2Id = "
+            f"'{_soql_escape(prod2)}' AND Pricebook2.IsStandard = true AND IsActive = true LIMIT 1"
+        )
+    else:
+        name = (os.getenv("SF_PRODUCT_NAME") or "Additional CRM Seats").strip()
+        q = (
+            "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Product2.Name = "
+            f"'{_soql_escape(name)}' AND Pricebook2.IsStandard = true AND IsActive = true LIMIT 1"
+        )
+    res = sf.query(q)
+    recs = res.get("records") or []
+    if not recs:
+        log.warning(
+            "No standard PricebookEntry for expansion product — set SF_PRODUCT_NAME (default "
+            "'Additional CRM Seats'), SF_PRODUCT2_ID, or SF_PRICEBOOK_ENTRY_ID"
+        )
+        return None
+    return str(recs[0]["Id"]), str(recs[0]["Pricebook2Id"])
+
+
+def _attach_opportunity_line_items(
+    sf: Salesforce,
+    opp_id: str,
+    pending: list[tuple[str, int, int, str, float | None]],
+) -> None:
+    """One OpportunityLineItem per Chargebee line in pending (delta qty, UnitPrice from Chargebee)."""
+    resolved = _resolve_pricebook_entry(sf)
+    if not resolved:
+        return
+    pbe_id, pb2_id = resolved
+    try:
+        sf.Opportunity.update(opp_id, {"Pricebook2Id": pb2_id})
+    except Exception:
+        log.exception("Could not set Opportunity Pricebook2Id")
+        return
+
+    for _key, _new_qty, delta, ip_id, up in pending:
+        if delta <= 0:
+            continue
+        body: dict[str, Any] = {
+            "OpportunityId": opp_id,
+            "PricebookEntryId": pbe_id,
+            "Quantity": delta,
+        }
+        if up is not None:
+            body["UnitPrice"] = round(up, 2)
+        try:
+            sf.OpportunityLineItem.create(body)
+            log.info("Added OpportunityLineItem opp=%s qty=%s unit_price=%s item_price_id=%s", opp_id, delta, up, ip_id)
+        except Exception:
+            log.exception("OpportunityLineItem create failed item_price_id=%s", ip_id)
+
+
 def _check_basic_auth() -> bool:
     user = (os.getenv("WEBHOOK_BASIC_USER") or "").strip()
     password = (os.getenv("WEBHOOK_BASIC_PASS") or "").strip()
@@ -245,7 +318,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 new_qty = int(qty_raw) if qty_raw is not None else 0
             except (TypeError, ValueError):
                 new_qty = 0
-            key = _line_key(subscription_id, str(ip_id))
+            key = self_service_line_state_key(subscription_id, str(ip_id))
             old_qty = lines.get(key)
             if old_qty is None:
                 lines[key] = new_qty
@@ -297,6 +370,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     amount=amount,
                 )
                 log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
+                _attach_opportunity_line_items(sf, oid, pending)
                 for key, new_qty, _, _, _ in pending:
                     lines[key] = new_qty
             else:
