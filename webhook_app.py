@@ -108,19 +108,35 @@ def _log_salesforce_failure(operation: str, exc: BaseException, payload: Any = N
     log.error("%s failed status=%s keys=%s detail=%s", operation, status, keys, detail[:8000])
 
 
+def _salesforce_error_entries(exc: BaseException) -> list[dict[str, Any]]:
+    """Normalize simple_salesforce exception body (bytes, str JSON, or pre-parsed list)."""
+    raw = getattr(exc, "content", None)
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if isinstance(raw, bytes):
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return []
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict)]
+        return []
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict)]
+    return []
+
+
 def _invalid_field_names_from_salesforce(exc: BaseException) -> list[str]:
     """Parse INVALID_FIELD_FOR_INSERT_UPDATE field list from API error body."""
-    raw = getattr(exc, "content", None)
-    if not isinstance(raw, bytes):
-        return []
-    try:
-        errs = json.loads(raw.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return []
-    if not isinstance(errs, list):
-        return []
     out: list[str] = []
-    for err in errs:
+    for err in _salesforce_error_entries(exc):
         if err.get("errorCode") != "INVALID_FIELD_FOR_INSERT_UPDATE":
             continue
         out.extend(err.get("fields") or [])
@@ -314,7 +330,16 @@ def _create_expansion_opportunity(
             return str(oid)
         except Exception as exc:
             last_exc = exc
-            if getattr(exc, "status", None) != 400:
+            status = getattr(exc, "status", None)
+            if status is None:
+                _log_salesforce_failure("Opportunity.create", exc, body)
+                raise
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                _log_salesforce_failure("Opportunity.create", exc, body)
+                raise
+            if code != 400:
                 _log_salesforce_failure("Opportunity.create", exc, body)
                 raise
             drop = _invalid_field_names_from_salesforce(exc)
