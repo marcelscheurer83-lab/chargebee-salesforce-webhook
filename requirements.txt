@@ -7,5 +7,10 @@ google-auth>=2.0.0
 google-auth-oauthlib>=1.0.0
 google-auth-httplib2>=0.1.0
 
+# Webhook service (Chargebee → Salesforce)
+flask>=3.0.0
+gunicorn>=22.0.0
+simple-salesforce>=1.12.0
+
 # Environment
 python-dotenv>=1.0.0

@@ -15,7 +15,7 @@ def main() -> None:
     print(f"Fetched {len(rows) - 1} customers (+ header).")
 
     if len(rows) <= 1:
-        print("No customers found with those add-ons. Check ADDON_ITEM_PRICE_IDS in chargebee_client.py.")
+        print("No rows found. Check Chargebee data or CHARGEBEE_ADDON_IDS in chargebee_client.py / .env.")
         return
 
     print("Writing to Google Sheet...")

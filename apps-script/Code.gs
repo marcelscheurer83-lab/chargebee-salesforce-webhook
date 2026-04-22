@@ -6,7 +6,8 @@
  * 2. Set script properties: File → Project properties → Script properties
  *    - CHARGEBEE_SITE   (e.g. dazos — no .chargebee.com)
  *    - CHARGEBEE_API_KEY
- *    - ADDON_IDS        optional; comma-separated item_price_ids (default: the two CRM add-ons)
+ *    - ADDON_IDS        optional; comma-separated exact item_price_ids. Leave EMPTY to match
+ *                       any line whose item_price_id starts with Additional-CRM-User-Self-(Service|Serve)-USD-
  * 3. Add trigger: click the clock icon (Triggers) → Add Trigger
  *    - Function: runDailySync
  *    - Event: Time-driven → Day timer → 11:55 PM to 12:00 AM (or your preferred "end of day")
@@ -16,8 +17,49 @@
  */
 
 const BASE_TAB_NAME = 'Customers with CRM Add-Ons';
-const ADDON_IDS_DEFAULT = 'Additional-CRM-User-Self-Service-USD-Monthly,Additional-CRM-User-Self-Serve-USD-Monthly';
+/** Prefixes for item_price_id — any billing period / slug Chargebee uses after USD- */
+const ADDON_ITEM_PRICE_ID_PREFIXES = [
+  'Additional-CRM-User-Self-Service-USD-',
+  'Additional-CRM-User-Self-Serve-USD-',
+];
 const HEADERS = ['company', 'customer_id', 'add_on_item', 'quantity', 'unit_price', 'date_added'];
+
+/** Chargebee integer amounts are in cents for USD; zero-decimal currencies use whole units. */
+var ZERO_DECIMAL_CURRENCIES = {
+  BIF: 1, BYR: 1, CLF: 1, CLP: 1, CVE: 1, DJF: 1, GNF: 1, ISK: 1, JPY: 1, KMF: 1, KRW: 1,
+  MGA: 1, PYG: 1, RWF: 1, UGX: 1, VND: 1, VUV: 1, XAF: 1, XOF: 1, XPF: 1
+};
+
+/** Prefix match: any billing-period slug after ...-USD- */
+function isCrmAddonSubscriptionLine(ipId, itemType) {
+  if (!ipId) return false;
+  if ((itemType || '').toLowerCase() === 'plan') return false;
+  for (var p = 0; p < ADDON_ITEM_PRICE_ID_PREFIXES.length; p++) {
+    if (ipId.indexOf(ADDON_ITEM_PRICE_ID_PREFIXES[p]) === 0) return true;
+  }
+  return false;
+}
+
+function formatSubscriptionItemUnitPrice(item, currencyCode) {
+  if (item == null || typeof item !== 'object') {
+    return '';
+  }
+  var dec = item.unit_price_in_decimal;
+  if (dec != null && String(dec).trim() !== '') {
+    return String(dec).trim();
+  }
+  var raw = item.unit_price;
+  if (raw == null) return '';
+  var cur = (currencyCode || 'USD').toUpperCase();
+  if (ZERO_DECIMAL_CURRENCIES[cur]) {
+    return String(parseInt(raw, 10));
+  }
+  var major = parseInt(raw, 10) / 100;
+  if (major === Math.floor(major)) {
+    return String(Math.floor(major));
+  }
+  return major.toFixed(2);
+}
 
 function getProp(key) {
   return PropertiesService.getScriptProperties().getProperty(key) || '';
@@ -37,10 +79,13 @@ function runSync(isScheduled) {
   if (!site || !apiKey) {
     throw new Error('Set CHARGEBEE_SITE and CHARGEBEE_API_KEY in Script properties');
   }
-  const addonIdsStr = getProp('ADDON_IDS').trim() || ADDON_IDS_DEFAULT;
-  const addonIds = new Set(addonIdsStr.split(',').map(function(s) { return s.trim(); }).filter(Boolean));
+  const addonIdsStr = getProp('ADDON_IDS').trim();
+  var usePrefixMatch = !addonIdsStr;
+  var addonIds = usePrefixMatch
+    ? null
+    : new Set(addonIdsStr.split(',').map(function(s) { return s.trim(); }).filter(Boolean));
 
-  const rows = fetchChargebeeRows(site, apiKey, addonIds);
+  const rows = fetchChargebeeRows(site, apiKey, addonIds, usePrefixMatch);
   const tabName = BASE_TAB_NAME + '_' + formatTimestamp(new Date());
   writeToSheet(rows, tabName);
   if (!isScheduled) {
@@ -58,7 +103,7 @@ function formatTimestamp(d) {
   return y + '-' + m + '-' + day + '_' + h + '-' + min + '-' + s;
 }
 
-function fetchChargebeeRows(site, apiKey, addonIds) {
+function fetchChargebeeRows(site, apiKey, addonIds, usePrefixMatch) {
   const baseUrl = 'https://' + site + '.chargebee.com/api/v2/subscriptions';
   const basicAuth = Utilities.base64Encode(apiKey + ':');
   const rows = [HEADERS];
@@ -91,17 +136,20 @@ function fetchChargebeeRows(site, apiKey, addonIds) {
         const d = new Date(createdAt * 1000);
         dateAdded = d.getUTCFullYear() + '-' + ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2);
       }
+      const currency = sub.currency_code || 'USD';
       const items = sub.subscription_items || [];
       for (let j = 0; j < items.length; j++) {
-        const ipId = items[j].item_price_id;
-        if (!addonIds.has(ipId)) continue;
-        const qty = items[j].quantity;
-        let unitPrice = '';
-        if (items[j].unit_price_in_decimal != null && items[j].unit_price_in_decimal !== '') {
-          unitPrice = String(items[j].unit_price_in_decimal);
-        } else if (items[j].unit_price != null) {
-          unitPrice = String(items[j].unit_price);
+        const si = items[j];
+        if (si == null) continue;
+        const ipId = si.item_price_id;
+        if (!ipId) continue;
+        if (usePrefixMatch) {
+          if (!isCrmAddonSubscriptionLine(ipId, si.item_type)) continue;
+        } else if (!addonIds.has(ipId)) {
+          continue;
         }
+        const qty = si.quantity;
+        const unitPrice = formatSubscriptionItemUnitPrice(si, currency);
         rows.push([company, cid, ipId || '', qty != null ? String(qty) : '', unitPrice, dateAdded]);
       }
     }

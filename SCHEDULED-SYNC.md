@@ -24,7 +24,7 @@ The script runs **inside your Google Sheet** on a schedule. No GitHub, no server
    |-------------------|--------------------------------------------|
    | `CHARGEBEE_SITE`  | Your site name, e.g. `dazos` (no `.chargebee.com`) |
    | `CHARGEBEE_API_KEY` | Your Chargebee API key                   |
-   | `ADDON_IDS`       | (Optional) Comma-separated item price IDs. Leave empty to use the default two CRM add-ons. |
+   | `ADDON_IDS`       | (Optional) Comma-separated **exact** item price IDs only. **Leave empty** to match all CRM Self‑Service USD add-ons by prefix (recommended). |
 
 5. **Add a daily trigger**
    - Click the **clock icon** (Triggers) in the left sidebar.

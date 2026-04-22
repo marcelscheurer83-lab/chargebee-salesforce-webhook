@@ -1,0 +1,9 @@
+# https://docs.railway.com/config-as-code/reference
+# Ensures Docker image build (not Railpack) when a Dockerfile exists.
+
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 120

@@ -12,11 +12,85 @@ from dotenv import load_dotenv
 _load_env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(_load_env_path)
 
-# Add-on item price IDs to find customers for (CRM add-ons from your sheet)
-ADDON_ITEM_PRICE_IDS = [
-    "Additional-CRM-User-Self-Service-USD-Monthly",
-    "Additional-CRM-User-Self-Serve-USD-Monthly",
-]
+# Match subscription lines by item_price_id prefix (any billing period / slug Chargebee uses).
+# Run python list_crm_item_price_ids.py to see actual ids on your site.
+ADDON_ITEM_PRICE_ID_PREFIXES = (
+    "Additional-CRM-User-Self-Service-USD-",
+    "Additional-CRM-User-Self-Serve-USD-",
+)
+
+# Optional: set CHARGEBEE_ADDON_IDS in .env to a comma-separated list of exact item_price_ids
+# to use exact matching instead of prefixes (e.g. if you must exclude a SKU).
+
+
+def _crm_addon_line_matches(
+    item_price_id: str | None,
+    item_type: str | None,
+    exact_ids: frozenset[str] | None,
+) -> bool:
+    if not item_price_id:
+        return False
+    if (item_type or "").lower() == "plan":
+        return False
+    ip = item_price_id.strip()
+    if exact_ids is not None:
+        return ip in exact_ids
+    return any(ip.startswith(p) for p in ADDON_ITEM_PRICE_ID_PREFIXES)
+
+
+def _addon_exact_ids_from_env() -> frozenset[str] | None:
+    raw = (os.getenv("CHARGEBEE_ADDON_IDS") or "").strip()
+    if not raw:
+        return None
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())
+
+# Chargebee stores integer amounts in smallest currency unit except these (whole major units).
+_ZERO_DECIMAL_CURRENCIES = frozenset(
+    {
+        "BIF",
+        "BYR",
+        "CLF",
+        "CLP",
+        "CVE",
+        "DJF",
+        "GNF",
+        "ISK",
+        "JPY",
+        "KMF",
+        "KRW",
+        "MGA",
+        "PYG",
+        "RWF",
+        "UGX",
+        "VND",
+        "VUV",
+        "XAF",
+        "XOF",
+        "XPF",
+    }
+)
+
+
+def _format_subscription_item_unit_price(
+    si: Any, currency_code: str | None
+) -> str:
+    """Match Chargebee UI: major currency unit (e.g. 200.00 for USD $200), not raw cents."""
+    if si is None:
+        return ""
+    dec = getattr(si, "unit_price_in_decimal", None)
+    if dec is not None and str(dec).strip() != "":
+        return str(dec).strip()
+    raw = getattr(si, "unit_price", None)
+    if raw is None:
+        return ""
+    cur = (currency_code or "USD").upper()
+    if cur in _ZERO_DECIMAL_CURRENCIES:
+        return str(int(raw))
+    # USD, EUR, etc.: API value is in cents / minor units
+    major = int(raw) / 100.0
+    if major == int(major):
+        return str(int(major))
+    return f"{major:.2f}"
 
 
 def get_client() -> Chargebee:
@@ -47,18 +121,17 @@ def fetch_customers_with_addons(
     item_price_ids: list[str] | None = None,
 ) -> list[list]:
     """
-    Find all subscription line items that are one of the given add-on item_price_ids.
-    Returns one row per add-on line with: company, customer_id, add_on_item, quantity,
-    unit_price, date_added. unit_price uses unit_price_in_decimal when set, else unit_price
-    (smallest currency unit, e.g. cents for USD).
-    Only includes subscriptions with status "active" (excludes in_trial, non_renewing, cancelled).
-    Chargebee's list filter "item_price_id" applies to the plan only, so we list subscriptions
-    and check subscription_items client-side.
+    Find CRM Self-Service USD add-on lines (item_price_id prefix match, or exact ids from env
+    CHARGEBEE_ADDON_IDS / item_price_ids arg). Returns one row per line: company, customer_id,
+    add_on_item, quantity, unit_price, date_added. Only active subscriptions.
     """
     if client is None:
         client = get_client()
-    ids = item_price_ids or ADDON_ITEM_PRICE_IDS
-    ids_set = set(ids)
+    exact: frozenset[str] | None
+    if item_price_ids is not None and len(item_price_ids) > 0:
+        exact = frozenset(item_price_ids)
+    else:
+        exact = _addon_exact_ids_from_env()
 
     rows: list[list] = []
     headers = ["company", "customer_id", "add_on_item", "quantity", "unit_price", "date_added"]
@@ -87,21 +160,18 @@ def fetch_customers_with_addons(
                     date_added = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
                 except (TypeError, ValueError, OSError):
                     date_added = str(ts)
+            currency = getattr(sub, "currency_code", None) or "USD"
             items = getattr(sub, "subscription_items", None) or []
             for si in items:
+                if si is None:
+                    continue
                 ip_id = getattr(si, "item_price_id", None)
-                if ip_id not in ids_set:
+                itype = getattr(si, "item_type", None)
+                if not _crm_addon_line_matches(ip_id, itype, exact):
                     continue
                 qty = getattr(si, "quantity", None)
                 quantity = str(qty) if qty is not None else ""
-                dec = getattr(si, "unit_price_in_decimal", None) or ""
-                raw = getattr(si, "unit_price", None)
-                if dec:
-                    unit_price = str(dec)
-                elif raw is not None:
-                    unit_price = str(raw)
-                else:
-                    unit_price = ""
+                unit_price = _format_subscription_item_unit_price(si, currency)
                 rows.append([company, cid, ip_id or "", quantity, unit_price, date_added])
         next_offset = getattr(response, "next_offset", None)
         if not next_offset:
