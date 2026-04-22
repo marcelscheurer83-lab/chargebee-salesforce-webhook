@@ -16,8 +16,10 @@ if you need quantities to survive redeploys (otherwise the next event re-baselin
 Run `python seed_webhook_state.py` (with Chargebee API env vars) or POST `/admin/seed-state` with
 header `X-Seed-Secret` (= `WEBHOOK_SEED_SECRET`) to merge current Chargebee quantities into state.
 
-First time we see a subscription line we only record quantity (no Opportunity).
-When quantity increases, we create one Opportunity per webhook (seat increases aggregated).
+If a subscription line has no stored quantity yet, we treat the prior quantity as 0 so the
+first seats added (e.g. 0→1) create an Opportunity. Run seed_webhook_state (or POST /admin/seed-state)
+so existing high quantities in Chargebee are in state before go-live—otherwise the first webhook
+after deploy could count the full current qty as "new" seats.
 """
 
 from __future__ import annotations
@@ -320,11 +322,8 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             except (TypeError, ValueError):
                 new_qty = 0
             key = self_service_line_state_key(subscription_id, str(ip_id))
-            old_qty = lines.get(key)
-            if old_qty is None:
-                lines[key] = new_qty
-                log.info("Baseline quantity key=%s qty=%s", key, new_qty)
-                continue
+            stored = lines.get(key)
+            old_qty = 0 if stored is None else stored
             if new_qty < old_qty:
                 lines[key] = new_qty
                 continue
