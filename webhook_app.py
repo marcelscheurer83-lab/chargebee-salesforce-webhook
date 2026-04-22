@@ -59,6 +59,15 @@ _STATE_PATH = Path(
     os.getenv("WEBHOOK_STATE_PATH", str(Path(__file__).resolve().parent / "webhook_state.json"))
 )
 
+if (os.getenv("SF_USE_QUOTE_FOR_PRODUCTS", "") or "").strip().lower() in ("1", "true", "yes"):
+    log.info(
+        "SF_USE_QUOTE_FOR_PRODUCTS on: creates Quote + QuoteLineItems (Related list Quotes, not Products)"
+    )
+else:
+    log.info(
+        "SF_USE_QUOTE_FOR_PRODUCTS off: creates OpportunityLineItems (shows under Opportunity Products)"
+    )
+
 
 def _load_state() -> dict[str, Any]:
     if not _STATE_PATH.exists():
@@ -172,6 +181,21 @@ def _months_between_start_and_end(start: date, end: date) -> int:
     if end < start:
         return 0
     return max(0, (end.year - start.year) * 12 + (end.month - start.month))
+
+
+def _opportunity_mrr_field_updates(amount: float | None) -> dict[str, float]:
+    """Delta-based MRR (Chargebee unit price × seat delta) for mapped Opportunity fields."""
+    if amount is None:
+        return {}
+    amt = round(float(amount), 2)
+    patch: dict[str, float] = {}
+    mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
+    if mrr_f and _valid_sf_field_api_name(mrr_f):
+        patch[mrr_f] = amt
+    exp_f = (os.getenv("SF_OPP_EXPANSION_MRR_FIELD") or "").strip()
+    if exp_f and _valid_sf_field_api_name(exp_f):
+        patch[exp_f] = amt
+    return patch
 
 
 def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) -> date | None:
@@ -339,9 +363,7 @@ def _create_expansion_opportunity(
         body[term_f] = float(term_months)
     # MRR is set after OpportunityLineItem / QuoteLineItem rows (many orgs use formulas tied to products).
     if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
-        mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
-        if mrr_f and _valid_sf_field_api_name(mrr_f) and amount is not None:
-            body[mrr_f] = round(float(amount), 2)
+        body.update(_opportunity_mrr_field_updates(amount))
 
     last_exc: BaseException | None = None
     for _attempt in range(8):
@@ -392,18 +414,16 @@ def _update_opportunity_mrr_after_products(
 ) -> None:
     if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
         return
-    mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
-    if not mrr_f or not _valid_sf_field_api_name(mrr_f) or amount is None:
+    patch = _opportunity_mrr_field_updates(amount)
+    if not patch:
         return
-    patch = {mrr_f: round(float(amount), 2)}
     try:
         sf.Opportunity.update(opp_id, patch)
-        log.info("Set %s on Opportunity %s", mrr_f, opp_id)
+        log.info("Set MRR field(s) on Opportunity %s: %s", opp_id, sorted(patch.keys()))
     except Exception as exc:
         _log_salesforce_failure("Opportunity.update (MRR)", exc, patch)
         log.warning(
-            "Could not set %s (formula/rollup, FLS, or validation). Opportunity %s still created.",
-            mrr_f,
+            "Could not set MRR field(s) (formula/rollup, FLS, or validation). Opportunity %s still created.",
             opp_id,
         )
 
