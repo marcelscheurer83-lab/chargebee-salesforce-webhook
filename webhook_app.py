@@ -2,8 +2,9 @@
 Chargebee webhook → Salesforce expansion Opportunity (minimal service).
 
 Designed to run on a host with a public URL (Railway, Render, Fly.io, Google Cloud Run, etc.),
-not on your laptop. Use the repo Dockerfile; set environment variables in the host’s dashboard
-(same names as .env.example — you do not need a .env file on the server).
+not on your laptop. Salesforce field API names and options can live in one JSON file
+(`salesforce_field_map.json` or `SF_CONFIG_JSON`) so you do not need dozens of separate host vars;
+secrets (passwords, API keys) should stay in the host env. See `.env.example`.
 
 Chargebee: Settings → Configure Chargebee → Webhooks
   - URL: https://<your-host>/chargebee
@@ -46,8 +47,10 @@ from chargebee_client import (
     self_service_line_state_key,
 )
 from seed_webhook_state import merge_chargebee_into_state_file
+from sf_config import init_sf_config, sf_cfg
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
+init_sf_config()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook_app")
@@ -121,7 +124,7 @@ def _valid_sf_field_api_name(name: str) -> bool:
 
 def _sf_date_payload(d: date) -> str:
     """Date custom fields usually accept YYYY-MM-DD; DateTime fields need a full instant."""
-    if (os.getenv("SF_OPP_DATE_FIELDS_USE_DATETIME", "") or "").strip() in ("1", "true", "True"):
+    if (sf_cfg("SF_OPP_DATE_FIELDS_USE_DATETIME") or "").strip().lower() in ("1", "true", "yes"):
         return f"{d.isoformat()}T00:00:00.000Z"
     return d.isoformat()
 
@@ -209,10 +212,10 @@ def _opportunity_mrr_field_updates(amount: float | None) -> dict[str, float]:
         return {}
     amt = round(float(amount), 2)
     patch: dict[str, float] = {}
-    mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
+    mrr_f = sf_cfg("SF_OPP_MRR_FIELD")
     if mrr_f and _valid_sf_field_api_name(mrr_f):
         patch[mrr_f] = amt
-    exp_f = (os.getenv("SF_OPP_EXPANSION_MRR_FIELD") or "").strip()
+    exp_f = sf_cfg("SF_OPP_EXPANSION_MRR_FIELD")
     if exp_f and _valid_sf_field_api_name(exp_f):
         patch[exp_f] = amt
     return patch
@@ -226,14 +229,14 @@ def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) 
     If SF_RENEWAL_CONTRACT_START_DATE_FIELD is unset but SF_RENEWAL_CONTRACT_END_DATE_FIELD is set,
     falls back to that renewal end date (legacy).
     """
-    start_field = (os.getenv("SF_RENEWAL_CONTRACT_START_DATE_FIELD") or "").strip()
-    end_field = (os.getenv("SF_RENEWAL_CONTRACT_END_DATE_FIELD") or "").strip()
+    start_field = sf_cfg("SF_RENEWAL_CONTRACT_START_DATE_FIELD")
+    end_field = sf_cfg("SF_RENEWAL_CONTRACT_END_DATE_FIELD")
     use_start = bool(start_field and _valid_sf_field_api_name(start_field))
     use_end = bool(not use_start and end_field and _valid_sf_field_api_name(end_field))
     if not use_start and not use_end:
         return None
     select_field = start_field if use_start else end_field
-    rt_dev = (os.getenv("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME") or "Renewal").strip()
+    rt_dev = sf_cfg("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME", "Renewal")
     if not rt_dev or not _valid_sf_field_api_name(rt_dev):
         return None
     safe_acc = _soql_escape(account_id)
@@ -265,10 +268,10 @@ def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) 
 
 
 def _get_salesforce() -> Salesforce:
-    username = (os.getenv("SF_USERNAME") or "").strip()
-    password = (os.getenv("SF_PASSWORD") or "").strip()
-    token = (os.getenv("SF_SECURITY_TOKEN") or "").strip()
-    domain = (os.getenv("SF_DOMAIN") or "login").strip()
+    username = sf_cfg("SF_USERNAME")
+    password = sf_cfg("SF_PASSWORD")
+    token = sf_cfg("SF_SECURITY_TOKEN")
+    domain = sf_cfg("SF_DOMAIN", "login")
     if not username or not password:
         raise ValueError("Set SF_USERNAME and SF_PASSWORD in .env (and SF_SECURITY_TOKEN if required).")
     # simple_salesforce requires security_token as its own arg (use "" if login IP is trusted / no token).
@@ -281,13 +284,13 @@ def _get_salesforce() -> Salesforce:
 
 
 def _resolve_account_id(sf: Salesforce, customer: dict[str, Any], customer_id: str) -> str | None:
-    cb_field = (os.getenv("CHARGEBEE_CUSTOMER_SF_ACCOUNT_FIELD") or "").strip()
+    cb_field = sf_cfg("CHARGEBEE_CUSTOMER_SF_ACCOUNT_FIELD")
     if cb_field:
         raw = customer.get(cb_field)
         if raw and str(raw).strip():
             return str(raw).strip()
 
-    acc_field = (os.getenv("SF_ACCOUNT_CHARGEBEE_CUSTOMER_FIELD") or "").strip()
+    acc_field = sf_cfg("SF_ACCOUNT_CHARGEBEE_CUSTOMER_FIELD")
     if not acc_field:
         log.warning(
             "No Account mapping: set CHARGEBEE_CUSTOMER_SF_ACCOUNT_FIELD (Chargebee CF API name) "
@@ -344,18 +347,17 @@ def _create_expansion_opportunity(
     contract_end: date | None,
     term_months: int | None,
 ) -> str:
-    stage = (os.getenv("SF_OPPORTUNITY_STAGE") or "Prospecting").strip()
-    use_event_close = (os.getenv("SF_OPPORTUNITY_CLOSE_DATE_USE_EVENT", "1") or "1").strip() not in (
+    stage = sf_cfg("SF_OPPORTUNITY_STAGE", "Prospecting")
+    use_event_close = (sf_cfg("SF_OPPORTUNITY_CLOSE_DATE_USE_EVENT", "1") or "1").strip().lower() not in (
         "0",
         "false",
-        "False",
     )
     if use_event_close:
         close_d = sync_date
     else:
-        close_days = int((os.getenv("SF_OPPORTUNITY_CLOSE_DAYS") or "30").strip() or "30")
+        close_days = int((sf_cfg("SF_OPPORTUNITY_CLOSE_DAYS", "30") or "30").strip() or "30")
         close_d = date.today() + timedelta(days=close_days)
-    name = (os.getenv("SF_OPPORTUNITY_NAME_TEMPLATE") or "Expansion: {company} (+{delta} CRM self-serve seats)").format(
+    name = (sf_cfg("SF_OPPORTUNITY_NAME_TEMPLATE", "Expansion: {company} (+{delta} CRM self-serve seats)")).format(
         company=company or customer_id,
         delta=total_seat_delta,
     )
@@ -366,23 +368,23 @@ def _create_expansion_opportunity(
         "CloseDate": close_d.isoformat(),
         "Description": description,
     }
-    rt = (os.getenv("SF_OPPORTUNITY_RECORD_TYPE_ID") or "").strip()
+    rt = sf_cfg("SF_OPPORTUNITY_RECORD_TYPE_ID")
     if rt:
         body["RecordTypeId"] = rt
     if amount is not None:
         body["Amount"] = round(amount, 2)
 
-    start_f = (os.getenv("SF_OPP_CONTRACT_START_DATE_FIELD") or "").strip()
+    start_f = sf_cfg("SF_OPP_CONTRACT_START_DATE_FIELD")
     if start_f and _valid_sf_field_api_name(start_f):
         body[start_f] = _sf_date_payload(sync_date)
-    end_f = (os.getenv("SF_OPP_CONTRACT_END_DATE_FIELD") or "").strip()
+    end_f = sf_cfg("SF_OPP_CONTRACT_END_DATE_FIELD")
     if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
         body[end_f] = _sf_date_payload(contract_end)
-    term_f = (os.getenv("SF_OPP_TERM_MONTHS_FIELD") or "").strip()
+    term_f = sf_cfg("SF_OPP_TERM_MONTHS_FIELD")
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         body[term_f] = float(term_months)
     # MRR is set after QuoteLineItem rows (many orgs use formulas tied to products).
-    if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
+    if (sf_cfg("SF_OPP_MRR_SET_ON_CREATE") or "").strip().lower() in ("1", "true", "yes"):
         body.update(_opportunity_mrr_field_updates(amount))
 
     last_exc: BaseException | None = None
@@ -432,7 +434,7 @@ def _create_expansion_opportunity(
 def _update_opportunity_mrr_after_products(
     sf: Salesforce, opp_id: str, amount: float | None
 ) -> None:
-    if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
+    if (sf_cfg("SF_OPP_MRR_SET_ON_CREATE") or "").strip().lower() in ("1", "true", "yes"):
         return
     patch = _opportunity_mrr_field_updates(amount)
     if not patch:
@@ -450,7 +452,7 @@ def _update_opportunity_mrr_after_products(
 
 def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
     """Return (PricebookEntryId, Pricebook2Id) for quote / product lines."""
-    pbe_env = (os.getenv("SF_PRICEBOOK_ENTRY_ID") or "").strip()
+    pbe_env = sf_cfg("SF_PRICEBOOK_ENTRY_ID")
     if pbe_env:
         res = sf.query(
             "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Id = "
@@ -462,14 +464,14 @@ def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
         log.warning("SF_PRICEBOOK_ENTRY_ID not found")
         return None
 
-    prod2 = (os.getenv("SF_PRODUCT2_ID") or "").strip()
+    prod2 = sf_cfg("SF_PRODUCT2_ID")
     if prod2:
         q = (
             "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Product2Id = "
             f"'{_soql_escape(prod2)}' AND Pricebook2.IsStandard = true AND IsActive = true LIMIT 1"
         )
     else:
-        name = (os.getenv("SF_PRODUCT_NAME") or "Additional CRM Seats").strip()
+        name = (sf_cfg("SF_PRODUCT_NAME", "Additional CRM Seats") or "Additional CRM Seats").strip()
         q = (
             "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Product2.Name = "
             f"'{_soql_escape(name)}' AND Pricebook2.IsStandard = true AND IsActive = true LIMIT 1"
@@ -502,9 +504,9 @@ def _product_line_custom_fields(
 ) -> dict[str, Any]:
     """Optional custom fields for QuoteLineItem (SF_OLI_* env names kept for backward compatibility)."""
     out: dict[str, Any] = {}
-    start_f = (os.getenv("SF_OLI_START_DATE_FIELD") or "").strip()
-    end_f = (os.getenv("SF_OLI_END_DATE_FIELD") or "").strip()
-    term_f = (os.getenv("SF_OLI_TERM_MONTHS_FIELD") or "").strip()
+    start_f = sf_cfg("SF_OLI_START_DATE_FIELD")
+    end_f = sf_cfg("SF_OLI_END_DATE_FIELD")
+    term_f = sf_cfg("SF_OLI_TERM_MONTHS_FIELD")
     if start_f and _valid_sf_field_api_name(start_f):
         out[start_f] = _sf_date_payload(sync_date)
     if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
@@ -515,7 +517,7 @@ def _product_line_custom_fields(
 
 
 def _sf_quote_autorenew_payload() -> Any | None:
-    raw = (os.getenv("SF_QUOTE_AUTORENEW_VALUE") or "").strip()
+    raw = sf_cfg("SF_QUOTE_AUTORENEW_VALUE")
     if not raw:
         return None
     low = raw.lower()
@@ -535,25 +537,25 @@ def _merge_quote_header_custom_fields(
     amount: float | None,
 ) -> None:
     """Map org-specific Quote fields (contract dates, term, autorenew, MRR/ARR from seat-delta total)."""
-    start_f = (os.getenv("SF_QUOTE_CONTRACT_START_DATE_FIELD") or "").strip()
+    start_f = sf_cfg("SF_QUOTE_CONTRACT_START_DATE_FIELD")
     if start_f and _valid_sf_field_api_name(start_f):
         body[start_f] = _sf_date_payload(sync_date)
-    end_f = (os.getenv("SF_QUOTE_CONTRACT_END_DATE_FIELD") or "").strip()
+    end_f = sf_cfg("SF_QUOTE_CONTRACT_END_DATE_FIELD")
     if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
         body[end_f] = _sf_date_payload(contract_end)
-    term_f = (os.getenv("SF_QUOTE_TERM_MONTHS_FIELD") or "").strip()
+    term_f = sf_cfg("SF_QUOTE_TERM_MONTHS_FIELD")
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         body[term_f] = float(term_months)
-    ar_f = (os.getenv("SF_QUOTE_AUTORENEW_FIELD") or "").strip()
+    ar_f = sf_cfg("SF_QUOTE_AUTORENEW_FIELD")
     if ar_f and _valid_sf_field_api_name(ar_f):
         ar_v = _sf_quote_autorenew_payload()
         if ar_v is not None:
             body[ar_f] = ar_v
     if amount is not None:
-        mrr_f = (os.getenv("SF_QUOTE_MRR_FIELD") or "").strip()
+        mrr_f = sf_cfg("SF_QUOTE_MRR_FIELD")
         if mrr_f and _valid_sf_field_api_name(mrr_f):
             body[mrr_f] = round(float(amount), 2)
-        arr_f = (os.getenv("SF_QUOTE_ARR_FIELD") or "").strip()
+        arr_f = sf_cfg("SF_QUOTE_ARR_FIELD")
         if arr_f and _valid_sf_field_api_name(arr_f):
             body[arr_f] = round(float(amount) * 12.0, 2)
 
@@ -564,11 +566,11 @@ def _try_set_quote_syncing(sf: Salesforce, quote_id: str) -> None:
     If your org uses a custom checkbox instead, set SF_QUOTE_SYNCING_FIELD (and optional SF_QUOTE_SYNCING_VALUE).
     Salesforce CPQ (SBQQ__Quote__c) uses a different model — this applies to standard Quote only.
     """
-    if (os.getenv("SF_QUOTE_SYNC_TO_OPPORTUNITY", "1") or "").strip().lower() in ("0", "false", "no"):
+    if (sf_cfg("SF_QUOTE_SYNC_TO_OPPORTUNITY", "1") or "").strip().lower() in ("0", "false", "no"):
         return
-    alt = (os.getenv("SF_QUOTE_SYNCING_FIELD") or "").strip()
+    alt = sf_cfg("SF_QUOTE_SYNCING_FIELD")
     if alt and _valid_sf_field_api_name(alt):
-        vraw = (os.getenv("SF_QUOTE_SYNCING_VALUE") or "true").strip()
+        vraw = sf_cfg("SF_QUOTE_SYNCING_VALUE", "true")
         low = vraw.lower()
         if low in ("1", "true", "yes"):
             val: Any = True
@@ -598,7 +600,7 @@ def _create_expansion_quote(
     term_months: int | None,
     amount: float | None,
 ) -> str | None:
-    tmpl = (os.getenv("SF_QUOTE_NAME_TEMPLATE") or "Expansion quote (+{delta} CRM self-serve seats)").strip()
+    tmpl = sf_cfg("SF_QUOTE_NAME_TEMPLATE", "Expansion quote (+{delta} CRM self-serve seats)")
     try:
         name = tmpl.format(delta=total_seat_delta, company=company or "")[:255]
     except (KeyError, ValueError, IndexError):
@@ -607,12 +609,12 @@ def _create_expansion_quote(
         "OpportunityId": opp_id,
         "Name": name,
         "Pricebook2Id": pb2_id,
-        "Status": (os.getenv("SF_QUOTE_STATUS") or "Draft").strip(),
+        "Status": sf_cfg("SF_QUOTE_STATUS", "Draft"),
     }
-    qc = (os.getenv("SF_QUOTE_CONTACT_ID") or "").strip()
+    qc = sf_cfg("SF_QUOTE_CONTACT_ID")
     if qc:
         body["ContactId"] = qc
-    exp_raw = (os.getenv("SF_QUOTE_EXPIRATION_DAYS") or "30").strip() or "30"
+    exp_raw = (sf_cfg("SF_QUOTE_EXPIRATION_DAYS", "30") or "30").strip() or "30"
     try:
         exp_days = max(1, int(exp_raw))
     except ValueError:
@@ -697,10 +699,10 @@ def _add_quote_line_items(
         if up is not None:
             body["UnitPrice"] = round(up, 2)
             line_mrr = round(float(up) * float(delta), 2)
-            lm = (os.getenv("SF_QTI_MRR_FIELD") or "").strip()
+            lm = sf_cfg("SF_QTI_MRR_FIELD")
             if lm and _valid_sf_field_api_name(lm):
                 body[lm] = line_mrr
-            la = (os.getenv("SF_QTI_ARR_FIELD") or "").strip()
+            la = sf_cfg("SF_QTI_ARR_FIELD")
             if la and _valid_sf_field_api_name(la):
                 body[la] = round(line_mrr * 12.0, 2)
         try:

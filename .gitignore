@@ -5,3 +5,5 @@ __pycache__/
 venv/
 *.json
 !package.json
+!salesforce_field_map.example.json
+salesforce_field_map.json
