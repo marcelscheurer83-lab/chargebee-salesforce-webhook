@@ -108,6 +108,25 @@ def _log_salesforce_failure(operation: str, exc: BaseException, payload: Any = N
     log.error("%s failed status=%s keys=%s detail=%s", operation, status, keys, detail[:8000])
 
 
+def _invalid_field_names_from_salesforce(exc: BaseException) -> list[str]:
+    """Parse INVALID_FIELD_FOR_INSERT_UPDATE field list from API error body."""
+    raw = getattr(exc, "content", None)
+    if not isinstance(raw, bytes):
+        return []
+    try:
+        errs = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    if not isinstance(errs, list):
+        return []
+    out: list[str] = []
+    for err in errs:
+        if err.get("errorCode") != "INVALID_FIELD_FOR_INSERT_UPDATE":
+            continue
+        out.extend(err.get("fields") or [])
+    return out
+
+
 def _event_sync_date(payload: dict[str, Any]) -> date:
     ts = payload.get("occurred_at")
     if ts is not None:
@@ -285,15 +304,39 @@ def _create_expansion_opportunity(
         if mrr_f and _valid_sf_field_api_name(mrr_f) and amount is not None:
             body[mrr_f] = round(float(amount), 2)
 
-    try:
-        result = sf.Opportunity.create(body)
-    except Exception as exc:
-        _log_salesforce_failure("Opportunity.create", exc, body)
-        raise
-    oid = result.get("id")
-    if not oid:
-        raise RuntimeError(f"Salesforce Opportunity.create unexpected response: {result}")
-    return str(oid)
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            result = sf.Opportunity.create(body)
+            oid = result.get("id")
+            if not oid:
+                raise RuntimeError(f"Salesforce Opportunity.create unexpected response: {result}")
+            return str(oid)
+        except Exception as exc:
+            last_exc = exc
+            if getattr(exc, "status", None) != 400:
+                _log_salesforce_failure("Opportunity.create", exc, body)
+                raise
+            drop = _invalid_field_names_from_salesforce(exc)
+            if not drop:
+                _log_salesforce_failure("Opportunity.create", exc, body)
+                raise
+            removed = False
+            for f in drop:
+                if f in body:
+                    body.pop(f)
+                    removed = True
+            if not removed:
+                _log_salesforce_failure("Opportunity.create", exc, body)
+                raise
+            log.warning(
+                "Retrying Opportunity.create without non-writable fields (grant FLS or map a writable field): %s",
+                drop,
+            )
+    if last_exc:
+        _log_salesforce_failure("Opportunity.create", last_exc, body)
+        raise last_exc
+    raise RuntimeError("Opportunity.create exhausted retries")
 
 
 def _update_opportunity_mrr_after_products(
