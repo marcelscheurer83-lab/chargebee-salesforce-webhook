@@ -27,8 +27,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,64 @@ def _trim_processed_ids(ids: list[str], max_keep: int = 2000) -> list[str]:
 
 def _soql_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _valid_sf_field_api_name(name: str) -> bool:
+    return bool(name) and bool(re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name))
+
+
+def _event_sync_date(payload: dict[str, Any]) -> date:
+    ts = payload.get("occurred_at")
+    if ts is not None:
+        try:
+            return datetime.utcfromtimestamp(int(ts)).date()
+        except (TypeError, ValueError, OSError):
+            pass
+    return datetime.utcnow().date()
+
+
+def _parse_sf_date(val: Any) -> date | None:
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) >= 10:
+        try:
+            return date.fromisoformat(val[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _months_between_start_and_end(start: date, end: date) -> int:
+    """Whole calendar months from start month through end month (non-negative)."""
+    if end < start:
+        return 0
+    return max(0, (end.year - start.year) * 12 + (end.month - start.month))
+
+
+def _query_open_renewal_contract_end(sf: Salesforce, account_id: str) -> date | None:
+    """Contract end date from the newest open Renewal Opportunity on this Account."""
+    end_field = (os.getenv("SF_RENEWAL_CONTRACT_END_DATE_FIELD") or "").strip()
+    if not end_field or not _valid_sf_field_api_name(end_field):
+        return None
+    rt_dev = (os.getenv("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME") or "Renewal").strip()
+    if not rt_dev or not _valid_sf_field_api_name(rt_dev):
+        return None
+    safe_acc = _soql_escape(account_id)
+    q = (
+        f"SELECT {end_field} FROM Opportunity WHERE AccountId = '{safe_acc}' "
+        f"AND RecordType.DeveloperName = '{_soql_escape(rt_dev)}' AND IsClosed = false "
+        "ORDER BY CloseDate DESC LIMIT 1"
+    )
+    try:
+        res = sf.query(q)
+    except Exception:
+        log.exception("Renewal Opportunity SOQL failed")
+        return None
+    recs = res.get("records") or []
+    if not recs:
+        log.warning("No open Renewal Opportunity for Account %s (RecordType %s)", account_id, rt_dev)
+        return None
+    return _parse_sf_date(recs[0].get(end_field))
 
 
 def _get_salesforce() -> Salesforce:
@@ -158,10 +217,21 @@ def _create_expansion_opportunity(
     total_seat_delta: int,
     description: str,
     amount: float | None,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
 ) -> str:
     stage = (os.getenv("SF_OPPORTUNITY_STAGE") or "Prospecting").strip()
-    close_days = int((os.getenv("SF_OPPORTUNITY_CLOSE_DAYS") or "30").strip() or "30")
-    close_d = date.today() + timedelta(days=close_days)
+    use_event_close = (os.getenv("SF_OPPORTUNITY_CLOSE_DATE_USE_EVENT", "1") or "1").strip() not in (
+        "0",
+        "false",
+        "False",
+    )
+    if use_event_close:
+        close_d = sync_date
+    else:
+        close_days = int((os.getenv("SF_OPPORTUNITY_CLOSE_DAYS") or "30").strip() or "30")
+        close_d = date.today() + timedelta(days=close_days)
     name = (os.getenv("SF_OPPORTUNITY_NAME_TEMPLATE") or "Expansion: {company} (+{delta} CRM self-serve seats)").format(
         company=company or customer_id,
         delta=total_seat_delta,
@@ -178,6 +248,19 @@ def _create_expansion_opportunity(
         body["RecordTypeId"] = rt
     if amount is not None:
         body["Amount"] = round(amount, 2)
+
+    start_f = (os.getenv("SF_OPP_CONTRACT_START_DATE_FIELD") or "").strip()
+    if start_f and _valid_sf_field_api_name(start_f):
+        body[start_f] = sync_date.isoformat()
+    end_f = (os.getenv("SF_OPP_CONTRACT_END_DATE_FIELD") or "").strip()
+    if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
+        body[end_f] = contract_end.isoformat()
+    term_f = (os.getenv("SF_OPP_TERM_MONTHS_FIELD") or "").strip()
+    if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
+        body[term_f] = int(term_months)
+    mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
+    if mrr_f and _valid_sf_field_api_name(mrr_f) and amount is not None:
+        body[mrr_f] = round(amount, 2)
 
     result = sf.Opportunity.create(body)
     oid = result.get("id")
@@ -227,6 +310,10 @@ def _attach_opportunity_line_items(
     sf: Salesforce,
     opp_id: str,
     pending: list[tuple[str, int, int, str, float | None]],
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
 ) -> None:
     """One OpportunityLineItem per Chargebee line in pending (delta qty, UnitPrice from Chargebee)."""
     resolved = _resolve_pricebook_entry(sf)
@@ -239,6 +326,10 @@ def _attach_opportunity_line_items(
         log.exception("Could not set Opportunity Pricebook2Id")
         return
 
+    oli_start_f = (os.getenv("SF_OLI_START_DATE_FIELD") or "").strip()
+    oli_end_f = (os.getenv("SF_OLI_END_DATE_FIELD") or "").strip()
+    oli_term_f = (os.getenv("SF_OLI_TERM_MONTHS_FIELD") or "").strip()
+
     for _key, _new_qty, delta, ip_id, up in pending:
         if delta <= 0:
             continue
@@ -249,6 +340,12 @@ def _attach_opportunity_line_items(
         }
         if up is not None:
             body["UnitPrice"] = round(up, 2)
+        if oli_start_f and _valid_sf_field_api_name(oli_start_f):
+            body[oli_start_f] = sync_date.isoformat()
+        if oli_end_f and _valid_sf_field_api_name(oli_end_f) and contract_end is not None:
+            body[oli_end_f] = contract_end.isoformat()
+        if oli_term_f and _valid_sf_field_api_name(oli_term_f) and term_months is not None:
+            body[oli_term_f] = int(term_months)
         try:
             sf.OpportunityLineItem.create(body)
             log.info("Added OpportunityLineItem opp=%s qty=%s unit_price=%s item_price_id=%s", opp_id, delta, up, ip_id)
@@ -276,6 +373,8 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
     if event_type not in frozenset({"subscription_changed", "subscription_created"}):
         log.info("Ignoring event_type=%s", event_type)
         return
+
+    sync_date = _event_sync_date(payload)
 
     content = payload.get("content") or {}
     sub = content.get("subscription") or {}
@@ -358,6 +457,10 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 if any_price:
                     amount = amt_sum
                 desc = "\n".join(parts)
+                contract_end = _query_open_renewal_contract_end(sf, account_id)
+                term_months: int | None = None
+                if contract_end is not None:
+                    term_months = _months_between_start_and_end(sync_date, contract_end)
                 oid = _create_expansion_opportunity(
                     sf,
                     company=company,
@@ -368,9 +471,19 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     total_seat_delta=total_delta,
                     description=desc,
                     amount=amount,
+                    sync_date=sync_date,
+                    contract_end=contract_end,
+                    term_months=term_months,
                 )
                 log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
-                _attach_opportunity_line_items(sf, oid, pending)
+                _attach_opportunity_line_items(
+                    sf,
+                    oid,
+                    pending,
+                    sync_date=sync_date,
+                    contract_end=contract_end,
+                    term_months=term_months,
+                )
                 for key, new_qty, _, _, _ in pending:
                     lines[key] = new_qty
             else:
