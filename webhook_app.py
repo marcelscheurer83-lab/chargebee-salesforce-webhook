@@ -87,6 +87,27 @@ def _valid_sf_field_api_name(name: str) -> bool:
     return bool(name) and bool(re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name))
 
 
+def _sf_date_payload(d: date) -> str:
+    """Date custom fields usually accept YYYY-MM-DD; DateTime fields need a full instant."""
+    if (os.getenv("SF_OPP_DATE_FIELDS_USE_DATETIME", "") or "").strip() in ("1", "true", "True"):
+        return f"{d.isoformat()}T00:00:00.000Z"
+    return d.isoformat()
+
+
+def _log_salesforce_failure(operation: str, exc: BaseException, payload: Any = None) -> None:
+    raw = getattr(exc, "content", None)
+    if isinstance(raw, bytes):
+        try:
+            detail = raw.decode("utf-8")
+        except Exception:
+            detail = repr(raw)
+    else:
+        detail = str(raw) if raw else ""
+    status = getattr(exc, "status", None)
+    keys = list(payload.keys()) if isinstance(payload, dict) else payload
+    log.error("%s failed status=%s keys=%s detail=%s", operation, status, keys, detail[:8000])
+
+
 def _event_sync_date(payload: dict[str, Any]) -> date:
     ts = payload.get("occurred_at")
     if ts is not None:
@@ -251,22 +272,49 @@ def _create_expansion_opportunity(
 
     start_f = (os.getenv("SF_OPP_CONTRACT_START_DATE_FIELD") or "").strip()
     if start_f and _valid_sf_field_api_name(start_f):
-        body[start_f] = sync_date.isoformat()
+        body[start_f] = _sf_date_payload(sync_date)
     end_f = (os.getenv("SF_OPP_CONTRACT_END_DATE_FIELD") or "").strip()
     if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
-        body[end_f] = contract_end.isoformat()
+        body[end_f] = _sf_date_payload(contract_end)
     term_f = (os.getenv("SF_OPP_TERM_MONTHS_FIELD") or "").strip()
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
-        body[term_f] = int(term_months)
-    mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
-    if mrr_f and _valid_sf_field_api_name(mrr_f) and amount is not None:
-        body[mrr_f] = round(amount, 2)
+        body[term_f] = float(term_months)
+    # MRR is set after OpportunityLineItem rows (many orgs use formulas or validation tied to products).
+    if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
+        mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
+        if mrr_f and _valid_sf_field_api_name(mrr_f) and amount is not None:
+            body[mrr_f] = round(float(amount), 2)
 
-    result = sf.Opportunity.create(body)
+    try:
+        result = sf.Opportunity.create(body)
+    except Exception as exc:
+        _log_salesforce_failure("Opportunity.create", exc, body)
+        raise
     oid = result.get("id")
     if not oid:
         raise RuntimeError(f"Salesforce Opportunity.create unexpected response: {result}")
     return str(oid)
+
+
+def _update_opportunity_mrr_after_products(
+    sf: Salesforce, opp_id: str, amount: float | None
+) -> None:
+    if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
+        return
+    mrr_f = (os.getenv("SF_OPP_MRR_FIELD") or "").strip()
+    if not mrr_f or not _valid_sf_field_api_name(mrr_f) or amount is None:
+        return
+    patch = {mrr_f: round(float(amount), 2)}
+    try:
+        sf.Opportunity.update(opp_id, patch)
+        log.info("Set %s on Opportunity %s", mrr_f, opp_id)
+    except Exception as exc:
+        _log_salesforce_failure("Opportunity.update (MRR)", exc, patch)
+        log.warning(
+            "Could not set %s (formula/rollup, FLS, or validation). Opportunity %s still created.",
+            mrr_f,
+            opp_id,
+        )
 
 
 def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
@@ -341,11 +389,11 @@ def _attach_opportunity_line_items(
         if up is not None:
             body["UnitPrice"] = round(up, 2)
         if oli_start_f and _valid_sf_field_api_name(oli_start_f):
-            body[oli_start_f] = sync_date.isoformat()
+            body[oli_start_f] = _sf_date_payload(sync_date)
         if oli_end_f and _valid_sf_field_api_name(oli_end_f) and contract_end is not None:
-            body[oli_end_f] = contract_end.isoformat()
+            body[oli_end_f] = _sf_date_payload(contract_end)
         if oli_term_f and _valid_sf_field_api_name(oli_term_f) and term_months is not None:
-            body[oli_term_f] = int(term_months)
+            body[oli_term_f] = float(term_months)
         try:
             sf.OpportunityLineItem.create(body)
             log.info("Added OpportunityLineItem opp=%s qty=%s unit_price=%s item_price_id=%s", opp_id, delta, up, ip_id)
@@ -484,6 +532,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     contract_end=contract_end,
                     term_months=term_months,
                 )
+                _update_opportunity_mrr_after_products(sf, oid, amount)
                 for key, new_qty, _, _, _ in pending:
                     lines[key] = new_qty
             else:
