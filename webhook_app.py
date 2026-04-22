@@ -21,8 +21,8 @@ first seats added (e.g. 0→1) create an Opportunity. Run seed_webhook_state (or
 so existing high quantities in Chargebee are in state before go-live—otherwise the first webhook
 after deploy could count the full current qty as "new" seats.
 
-Products: by default adds OpportunityLineItems. Set SF_USE_QUOTE_FOR_PRODUCTS=1 to create a Quote
-on the expansion Opportunity and add QuoteLineItems instead (standard Salesforce Quotes).
+Products: always creates a Quote on the expansion Opportunity and adds QuoteLineItems (seat delta qty).
+After each successfully processed webhook, self-serve line quantities in state are synced from the payload.
 """
 
 from __future__ import annotations
@@ -59,14 +59,34 @@ _STATE_PATH = Path(
     os.getenv("WEBHOOK_STATE_PATH", str(Path(__file__).resolve().parent / "webhook_state.json"))
 )
 
-if (os.getenv("SF_USE_QUOTE_FOR_PRODUCTS", "") or "").strip().lower() in ("1", "true", "yes"):
-    log.info(
-        "SF_USE_QUOTE_FOR_PRODUCTS on: creates Quote + QuoteLineItems (Related list Quotes, not Products)"
-    )
-else:
-    log.info(
-        "SF_USE_QUOTE_FOR_PRODUCTS off: creates OpportunityLineItems (shows under Opportunity Products)"
-    )
+log.info("Expansion pricing: Quote + QuoteLineItems (standard); quote lines use seat delta quantity")
+
+
+def _sync_self_service_quantities_from_subscription(
+    items: list[Any],
+    lines: dict[str, int],
+    subscription_id: str,
+    exact: frozenset[str] | None,
+) -> None:
+    """Set stored qty for every self-serve line in this subscription payload (Chargebee = source of truth)."""
+    for si in items:
+        if not isinstance(si, dict):
+            continue
+        ip_id = si.get("item_price_id")
+        itype = si.get("item_type")
+        if not _crm_addon_line_matches(
+            str(ip_id) if ip_id else None,
+            str(itype) if itype else None,
+            exact,
+        ):
+            continue
+        qty_raw = si.get("quantity")
+        try:
+            new_qty = int(qty_raw) if qty_raw is not None else 0
+        except (TypeError, ValueError):
+            new_qty = 0
+        key = self_service_line_state_key(subscription_id, str(ip_id))
+        lines[key] = new_qty
 
 
 def _load_state() -> dict[str, Any]:
@@ -361,7 +381,7 @@ def _create_expansion_opportunity(
     term_f = (os.getenv("SF_OPP_TERM_MONTHS_FIELD") or "").strip()
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         body[term_f] = float(term_months)
-    # MRR is set after OpportunityLineItem / QuoteLineItem rows (many orgs use formulas tied to products).
+    # MRR is set after QuoteLineItem rows (many orgs use formulas tied to products).
     if (os.getenv("SF_OPP_MRR_SET_ON_CREATE", "") or "").strip() in ("1", "true", "True"):
         body.update(_opportunity_mrr_field_updates(amount))
 
@@ -429,7 +449,7 @@ def _update_opportunity_mrr_after_products(
 
 
 def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
-    """Return (PricebookEntryId, Pricebook2Id) for OpportunityLineItem rows."""
+    """Return (PricebookEntryId, Pricebook2Id) for quote / product lines."""
     pbe_env = (os.getenv("SF_PRICEBOOK_ENTRY_ID") or "").strip()
     if pbe_env:
         res = sf.query(
@@ -480,7 +500,7 @@ def _product_line_custom_fields(
     contract_end: date | None,
     term_months: int | None,
 ) -> dict[str, Any]:
-    """Shared custom fields for OpportunityLineItem and QuoteLineItem (same API names on both objects)."""
+    """Optional custom fields for QuoteLineItem (SF_OLI_* env names kept for backward compatibility)."""
     out: dict[str, Any] = {}
     start_f = (os.getenv("SF_OLI_START_DATE_FIELD") or "").strip()
     end_f = (os.getenv("SF_OLI_END_DATE_FIELD") or "").strip()
@@ -564,47 +584,6 @@ def _create_expansion_quote(
     return None
 
 
-def _add_opportunity_line_items(
-    sf: Salesforce,
-    opp_id: str,
-    pbe_id: str,
-    pending: list[tuple[str, int, int, str, float | None]],
-    *,
-    sync_date: date,
-    contract_end: date | None,
-    term_months: int | None,
-) -> None:
-    """One OpportunityLineItem per Chargebee line. Quantity: delta (default) or total (SF_OLI_QUANTITY_MODE)."""
-    qty_mode = (os.getenv("SF_OLI_QUANTITY_MODE") or "delta").strip().lower()
-    extras = _product_line_custom_fields(
-        sync_date=sync_date, contract_end=contract_end, term_months=term_months
-    )
-    for _key, _new_qty, delta, ip_id, up in pending:
-        if delta <= 0:
-            continue
-        oli_qty = float(_new_qty) if qty_mode == "total" else float(delta)
-        body: dict[str, Any] = {
-            "OpportunityId": opp_id,
-            "PricebookEntryId": pbe_id,
-            "Quantity": oli_qty,
-            **extras,
-        }
-        if up is not None:
-            body["UnitPrice"] = round(up, 2)
-        try:
-            sf.OpportunityLineItem.create(body)
-            log.info(
-                "Added OpportunityLineItem opp=%s qty=%s (%s) unit_price=%s item_price_id=%s",
-                opp_id,
-                oli_qty,
-                qty_mode,
-                up,
-                ip_id,
-            )
-        except Exception:
-            log.exception("OpportunityLineItem create failed item_price_id=%s", ip_id)
-
-
 def _add_quote_line_items(
     sf: Salesforce,
     quote_id: str,
@@ -615,15 +594,14 @@ def _add_quote_line_items(
     contract_end: date | None,
     term_months: int | None,
 ) -> None:
-    """One QuoteLineItem per Chargebee line. Quantity: SF_QUOTE_LINE_QUANTITY_MODE (default delta), not SF_OLI_QUANTITY_MODE."""
-    qty_mode = (os.getenv("SF_QUOTE_LINE_QUANTITY_MODE") or "delta").strip().lower()
+    """One QuoteLineItem per Chargebee line; Quantity = seat delta for this event."""
     extras = _product_line_custom_fields(
         sync_date=sync_date, contract_end=contract_end, term_months=term_months
     )
     for _key, _new_qty, delta, ip_id, up in pending:
         if delta <= 0:
             continue
-        qli_qty = float(_new_qty) if qty_mode == "total" else float(delta)
+        qli_qty = float(delta)
         body: dict[str, Any] = {
             "QuoteId": quote_id,
             "PricebookEntryId": pbe_id,
@@ -635,10 +613,9 @@ def _add_quote_line_items(
         try:
             sf.QuoteLineItem.create(body)
             log.info(
-                "Added QuoteLineItem quote=%s qty=%s (%s) unit_price=%s item_price_id=%s",
+                "Added QuoteLineItem quote=%s qty=%s (delta) unit_price=%s item_price_id=%s",
                 quote_id,
                 qli_qty,
-                qty_mode,
                 up,
                 ip_id,
             )
@@ -646,7 +623,7 @@ def _add_quote_line_items(
             log.exception("QuoteLineItem create failed item_price_id=%s", ip_id)
 
 
-def _attach_expansion_products(
+def _attach_expansion_quote_and_lines(
     sf: Salesforce,
     opp_id: str,
     *,
@@ -657,47 +634,31 @@ def _attach_expansion_products(
     contract_end: date | None,
     term_months: int | None,
 ) -> None:
-    """Attach products as OpportunityLineItems, or as a Quote + QuoteLineItems if SF_USE_QUOTE_FOR_PRODUCTS=1."""
+    """Create Quote on Opportunity and add QuoteLineItems (seat deltas)."""
     resolved = _resolve_pricebook_entry(sf)
     if not resolved:
         return
     pbe_id, pb2_id = resolved
     if not _ensure_opportunity_pricebook(sf, opp_id, pb2_id):
         return
-    use_quote = (os.getenv("SF_USE_QUOTE_FOR_PRODUCTS", "") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
+    qid = _create_expansion_quote(
+        sf,
+        opp_id,
+        company=company,
+        total_seat_delta=total_seat_delta,
+        pb2_id=pb2_id,
     )
-    if use_quote:
-        qid = _create_expansion_quote(
-            sf,
-            opp_id,
-            company=company,
-            total_seat_delta=total_seat_delta,
-            pb2_id=pb2_id,
-        )
-        if not qid:
-            return
-        _add_quote_line_items(
-            sf,
-            qid,
-            pbe_id,
-            pending,
-            sync_date=sync_date,
-            contract_end=contract_end,
-            term_months=term_months,
-        )
-    else:
-        _add_opportunity_line_items(
-            sf,
-            opp_id,
-            pbe_id,
-            pending,
-            sync_date=sync_date,
-            contract_end=contract_end,
-            term_months=term_months,
-        )
+    if not qid:
+        return
+    _add_quote_line_items(
+        sf,
+        qid,
+        pbe_id,
+        pending,
+        sync_date=sync_date,
+        contract_end=contract_end,
+        term_months=term_months,
+    )
 
 
 def _check_basic_auth() -> bool:
@@ -770,10 +731,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             key = self_service_line_state_key(subscription_id, str(ip_id))
             stored = lines.get(key)
             old_qty = 0 if stored is None else stored
-            if new_qty < old_qty:
-                lines[key] = new_qty
-                continue
-            if new_qty == old_qty:
+            if new_qty <= old_qty:
                 continue
 
             delta = new_qty - old_qty
@@ -823,7 +781,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     term_months=term_months,
                 )
                 log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
-                _attach_expansion_products(
+                _attach_expansion_quote_and_lines(
                     sf,
                     oid,
                     company=company or customer_id,
@@ -834,13 +792,14 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     term_months=term_months,
                 )
                 _update_opportunity_mrr_after_products(sf, oid, amount)
-                for key, new_qty, _, _, _ in pending:
-                    lines[key] = new_qty
             else:
                 log.warning("Skipping Opportunity: no Salesforce Account for customer_id=%s", customer_id)
                 mark_processed = False
 
         if mark_processed:
+            _sync_self_service_quantities_from_subscription(
+                items, lines, subscription_id, exact
+            )
             processed.append(event_id)
         state["processed_event_ids"] = _trim_processed_ids(processed)
         state["line_quantities"] = lines
