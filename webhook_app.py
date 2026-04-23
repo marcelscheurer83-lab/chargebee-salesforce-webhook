@@ -618,6 +618,24 @@ def _merge_quote_header_custom_fields(
     term_f = sf_cfg("SF_QUOTE_TERM_MONTHS_FIELD")
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         body[term_f] = float(term_months)
+    mirror = (sf_cfg("SF_QUOTE_HEADER_MIRROR_LINE_DATE_FIELDS") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if mirror:
+        if not start_f:
+            oli_s = sf_cfg("SF_OLI_START_DATE_FIELD")
+            if oli_s and _valid_sf_field_api_name(oli_s):
+                body[oli_s] = _sf_date_payload(sync_date)
+        if not end_f and contract_end is not None:
+            oli_e = sf_cfg("SF_OLI_END_DATE_FIELD")
+            if oli_e and _valid_sf_field_api_name(oli_e):
+                body[oli_e] = _sf_date_payload(contract_end)
+        if not term_f and term_months is not None:
+            oli_t = sf_cfg("SF_OLI_TERM_MONTHS_FIELD")
+            if oli_t and _valid_sf_field_api_name(oli_t):
+                body[oli_t] = float(term_months)
     ar_f = sf_cfg("SF_QUOTE_AUTORENEW_FIELD")
     if ar_f and _valid_sf_field_api_name(ar_f):
         ar_v = _sf_quote_autorenew_payload()
@@ -630,6 +648,65 @@ def _merge_quote_header_custom_fields(
         arr_f = sf_cfg("SF_QUOTE_ARR_FIELD")
         if arr_f and _valid_sf_field_api_name(arr_f):
             body[arr_f] = round(float(amount) * 12.0, 2)
+
+
+def _patch_quote_header_after_create(
+    sf: Salesforce,
+    quote_id: str,
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: int | None,
+    amount: float | None,
+) -> None:
+    """
+    Quote.create (especially minimal fallback) may omit custom header fields.
+    Patch contract dates / term / MRR onto the Quote with the same retry logic as create.
+    """
+    patch: dict[str, Any] = {}
+    _merge_quote_header_custom_fields(
+        patch,
+        sync_date=sync_date,
+        contract_end=contract_end,
+        term_months=term_months,
+        amount=amount,
+    )
+    if not patch:
+        return
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            sf.Quote.update(quote_id, patch)
+            log.info("Patched Quote header fields on %s: %s", quote_id, sorted(patch.keys()))
+            return
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                break
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                break
+            if code != 400:
+                break
+            drop = _fields_to_drop_from_salesforce_400(exc, patch)
+            if not drop:
+                break
+            removed = False
+            for f in drop:
+                if f in patch:
+                    patch.pop(f)
+                    removed = True
+            if not removed or not patch:
+                break
+            log.warning("Retrying Quote.update (header) without bad fields: %s", drop)
+    if last_exc:
+        log.warning(
+            "Quote header patch incomplete for %s (wrong API names, FLS, or formula fields). Last error: %s",
+            quote_id,
+            last_exc,
+        )
 
 
 def _try_set_quote_syncing(sf: Salesforce, quote_id: str) -> None:
@@ -913,6 +990,14 @@ def _attach_expansion_quote_and_lines(
             opp_id,
         )
         return
+    _patch_quote_header_after_create(
+        sf,
+        qid,
+        sync_date=sync_date,
+        contract_end=contract_end,
+        term_months=term_months,
+        amount=amount,
+    )
     _add_quote_line_items(
         sf,
         qid,
@@ -1000,6 +1085,13 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
 
             delta = new_qty - old_qty
             up = _unit_price_major(si, currency)
+            log.info(
+                "Self-serve line item_price_id=%s stored_qty=%s chargebee_qty=%s delta_qty=%s",
+                ip_id,
+                old_qty,
+                new_qty,
+                delta,
+            )
             pending.append((key, new_qty, delta, str(ip_id), up))
 
         mark_processed = True
