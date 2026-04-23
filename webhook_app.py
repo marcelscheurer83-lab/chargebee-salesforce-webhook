@@ -34,6 +34,9 @@ the latest Closed Won NB/Renewal Opportunity’s ContractId (SF_OPP_AMENDED_CONT
 SF_OPP_POPULATE_CONTRACT_LOOKUP + SOQL sets Opportunity ContractId. After each successful webhook,
 line quantities are synced from the payload, then optionally merged from Chargebee. Prorated Term (Months)
 (SF_USE_PRORATED_TERM_MONTHS) and ServiceDate on lines help match co-termed expansion subscription quotes.
+QLI Term (Months) defaults to matching QuoteLineItem End_Date__c formula math (Start_Date__c +
+Term_Months__c: ADDMONTHS - 1 day for whole months; fractional branch uses days in start month).
+Set SF_TERM_MONTHS_MATCH_OLI_FORMULA=0 only if you rely on proration/calendar term instead.
 QuoteLineItem API writes are start/term only when standard/custom line end fields are not writable.
 
 Expansion contract end is still read from the latest Closed Won New Business/Renewal for term math and
@@ -42,8 +45,10 @@ Quote header mapping (``SF_QUOTE_CONTRACT_END_DATE_FIELD``). Optional Chatter po
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -348,36 +353,175 @@ def _months_between_start_and_end(start: date, end: date) -> int:
     return max(0, (end.year - start.year) * 12 + (end.month - start.month))
 
 
+def _add_months_salesforce(start: date, months: int) -> date:
+    """Calendar add of whole months (Salesforce ADDMONTHS-style: clamp day to end of target month)."""
+    if months == 0:
+        return start
+    m0 = start.month - 1 + months
+    y = start.year + m0 // 12
+    mo = m0 % 12 + 1
+    last = calendar.monthrange(y, mo)[1]
+    day = min(start.day, last)
+    return date(y, mo, day)
+
+
+def _days_in_month_of_date(d: date) -> int:
+    """Days in d's month (28–31); matches MONTH length CASE + leap February in typical SF formulas."""
+    return calendar.monthrange(d.year, d.month)[1]
+
+
+def _round_half_up0(x: float) -> int:
+    """ROUND(x, 0) half-away-from-zero for positive fractional-day math."""
+    if x >= 0:
+        return int(math.floor(float(x) + 0.5))
+    return int(math.ceil(float(x) - 0.5))
+
+
+def _sf_oli_formula_end_date(start: date, term: float) -> date:
+    """
+    Mirror common QuoteLineItem End_Date__c formula driven by Start_Date__c + Term_Months__c:
+    - term == 0 → start
+    - whole months → ADDMONTHS(start, n) - 1 day
+    - else → ADDMONTHS(start, floor(term)) + ROUND(frac * days_in_month(start), 0) days
+    """
+    if term <= 0 or abs(term) < 1e-12:
+        return start
+    w = math.floor(term + 1e-15)
+    frac = term - w
+    whole = abs(frac) < 1e-9
+    if whole:
+        if w <= 0:
+            return start
+        return _add_months_salesforce(start, w) - timedelta(days=1)
+    dim = _days_in_month_of_date(start)
+    extra = _round_half_up0(frac * float(dim))
+    return _add_months_salesforce(start, w) + timedelta(days=extra)
+
+
+def _inverse_term_for_sf_oli_formula(start: date, end: date) -> float | None:
+    """Term (months) such that _sf_oli_formula_end_date(start, term) == end, if any within a bounded search."""
+    if end < start:
+        return None
+    if end == start:
+        return 0.0
+    for n in range(1, 1201):
+        if _add_months_salesforce(start, n) - timedelta(days=1) == end:
+            return float(n)
+    dim = _days_in_month_of_date(start)
+    if dim <= 0:
+        return None
+    for w in range(0, 1201):
+        base = _add_months_salesforce(start, w)
+        delta = (end - base).days
+        if delta < 0:
+            continue
+        if delta == 0:
+            if w == 0:
+                continue
+            term = w + (0.49 / float(dim))
+            if _sf_oli_formula_end_date(start, term) == end:
+                return term
+            continue
+        frac = delta / float(dim)
+        if frac <= 0 or frac >= 1:
+            continue
+        term = w + frac
+        if abs(term - round(term)) < 1e-7:
+            continue
+        if _sf_oli_formula_end_date(start, term) == end:
+            return term
+    lo, hi = 0.0, 1200.0
+    fe_lo = _sf_oli_formula_end_date(start, lo)
+    fe_hi = _sf_oli_formula_end_date(start, hi)
+    if fe_lo > end or fe_hi < end:
+        return None
+    best: float | None = None
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        c = _sf_oli_formula_end_date(start, mid)
+        if c == end:
+            best = mid
+            break
+        if c < end:
+            lo = mid
+        else:
+            hi = mid
+    if best is not None:
+        return best
+    for cand in (lo, hi, (lo + hi) / 2.0):
+        if _sf_oli_formula_end_date(start, cand) == end:
+            return cand
+    return None
+
+
+def _prorated_term_decimals() -> int:
+    try:
+        nd = int((sf_cfg("SF_PRORATED_TERM_DECIMALS") or "6").strip() or "6")
+    except ValueError:
+        nd = 6
+    return max(0, min(12, nd))
+
+
 def _prorated_term_months(start: date, end: date) -> float:
     """
     Fractional months from calendar day span (matches common CPQ co-term math: days / (365.25/12)).
     E.g. 364 days ≈ 11.97 months — aligns manual expansion quotes where Term (Months) is decimal.
 
-    When QuoteLineItem End Date is derived from Start Date + Term in Salesforce, low rounding (e.g. 2
-    decimals) can land one calendar day short of ``end``. Use ``SF_PRORATED_TERM_DECIMALS`` (default 6,
-    max 12) so the stored term matches the day span more closely. Ensure the Term field in Salesforce
-    has enough decimal places to accept the precision you send.
+    Prefer ``SF_TERM_MONTHS_MATCH_OLI_FORMULA=1`` when line End_Date__c is a formula of Start + Term
+    (ADDMONTHS rules); use proration when that flag is off or as fallback after an inverse solve fails.
+    Low rounding (e.g. 2 decimals) can land one day short of ``end``. Use ``SF_PRORATED_TERM_DECIMALS``
+    (default 6, max 12). Ensure the Term field allows enough decimal scale.
     """
     if end <= start:
         return 0.0
     days = (end - start).days
     months = days / (365.25 / 12.0)
-    try:
-        nd = int((sf_cfg("SF_PRORATED_TERM_DECIMALS") or "6").strip() or "6")
-    except ValueError:
-        nd = 6
-    nd = max(0, min(12, nd))
+    nd = _prorated_term_decimals()
     return round(months, nd)
 
 
 def _expansion_term_months(sync_date: date, contract_end: date | None) -> float | None:
-    """Quote + line term: prorated (SF_USE_PRORATED_TERM_MONTHS) or whole calendar months."""
+    """Quote + line term: QLI End_Date__c formula inverse (default), else proration or whole calendar months."""
     if contract_end is None:
         return None
+    nd = _prorated_term_decimals()
+    if _oli_formula_term_matching_enabled():
+        inv = _inverse_term_for_sf_oli_formula(sync_date, contract_end)
+        if inv is not None:
+            out = round(inv, nd)
+            log.info(
+                "Expansion term_months=%s (QLI formula inverse for contract_end=%s, sync=%s, decimals=%s)",
+                out,
+                contract_end.isoformat(),
+                sync_date.isoformat(),
+                nd,
+            )
+            return out
+        log.warning(
+            "SF_TERM_MONTHS_MATCH_OLI_FORMULA: no Term_Months__c matches ADDMONTHS-style line end "
+            "(sync=%s contract_end=%s); falling back to prorated/calendar term",
+            sync_date.isoformat(),
+            contract_end.isoformat(),
+        )
     if _truthy_cfg("SF_USE_PRORATED_TERM_MONTHS"):
-        return _prorated_term_months(sync_date, contract_end)
+        out = _prorated_term_months(sync_date, contract_end)
+        log.info(
+            "Expansion term_months=%s (prorated days/(365.25/12); sync=%s contract_end=%s)",
+            out,
+            sync_date.isoformat(),
+            contract_end.isoformat(),
+        )
+        return out
     cal = _months_between_start_and_end(sync_date, contract_end)
-    return float(cal) if cal > 0 else None
+    out = float(cal) if cal > 0 else None
+    if out is not None:
+        log.info(
+            "Expansion term_months=%s (calendar month span; sync=%s contract_end=%s)",
+            out,
+            sync_date.isoformat(),
+            contract_end.isoformat(),
+        )
+    return out
 
 
 def _opportunity_mrr_field_updates(amount: float | None) -> dict[str, float]:
@@ -543,6 +687,15 @@ def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) 
 
 def _truthy_cfg(key: str) -> bool:
     return (sf_cfg(key) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _oli_formula_term_matching_enabled() -> bool:
+    """
+    Solve Term_Months__c so QLI End_Date__c (ADDMONTHS + fractional-day formula) matches contract end.
+    Default on when unset — set SF_TERM_MONTHS_MATCH_OLI_FORMULA=0 to use only proration/calendar math.
+    """
+    raw = (sf_cfg("SF_TERM_MONTHS_MATCH_OLI_FORMULA") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _infer_baseline_from_chargebee_events_enabled() -> bool:
