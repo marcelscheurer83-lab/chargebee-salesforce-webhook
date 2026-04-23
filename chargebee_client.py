@@ -45,6 +45,50 @@ def _addon_exact_ids_from_env() -> frozenset[str] | None:
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
 
+def subscription_line_dicts_from_chargebee_retrieve(subscription_id: str) -> list[dict[str, Any]] | None:
+    """
+    Current subscription line rows from Chargebee API (source of truth for quantities).
+    Returns dicts shaped like webhook ``subscription_items`` entries for the webhook delta loop.
+    ``None`` if retrieve fails.
+    """
+    sid = (subscription_id or "").strip()
+    if not sid:
+        return None
+    try:
+        client = get_client()
+        res = client.Subscription.retrieve(sid)
+    except Exception:
+        return None
+    sub_obj = getattr(res, "subscription", None)
+    if sub_obj is None:
+        return None
+    raw_items = getattr(sub_obj, "subscription_items", None) or []
+    out: list[dict[str, Any]] = []
+    for si in raw_items:
+        if si is None:
+            continue
+        ip = getattr(si, "item_price_id", None)
+        itype = getattr(si, "item_type", None)
+        q = getattr(si, "quantity", None)
+        try:
+            qi = int(q) if q is not None else 0
+        except (TypeError, ValueError):
+            qi = 0
+        row: dict[str, Any] = {
+            "item_price_id": str(ip) if ip else None,
+            "item_type": str(itype) if itype else None,
+            "quantity": qi,
+        }
+        up = getattr(si, "unit_price", None)
+        if up is not None:
+            row["unit_price"] = up
+        dec = getattr(si, "unit_price_in_decimal", None)
+        if dec is not None and str(dec).strip() != "":
+            row["unit_price_in_decimal"] = str(dec).strip()
+        out.append(row)
+    return out
+
+
 def subscription_items_from_webhook_subscription(sub: dict[str, Any]) -> list[Any]:
     """
     Line items under ``content.subscription`` in Chargebee webhooks. Keys vary by product catalog /
@@ -275,7 +319,7 @@ def _subscription_addon_quantity_from_payload(sub: Any, item_price_id: str) -> i
     """Quantity for ``item_price_id`` on a subscription dict (webhook/API shape). ``None`` if wrong sub."""
     if not isinstance(sub, dict):
         return None
-    items = sub.get("subscription_items") or sub.get("subscription_items_list") or []
+    items = subscription_items_from_webhook_subscription(sub)
     if not isinstance(items, list):
         return None
     for si in items:

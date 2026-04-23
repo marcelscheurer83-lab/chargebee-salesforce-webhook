@@ -69,6 +69,7 @@ from chargebee_client import (
     infer_prior_self_serve_qty_from_subscription_changed_events,
     self_service_line_state_key,
     subscription_items_from_webhook_subscription,
+    subscription_line_dicts_from_chargebee_retrieve,
 )
 from seed_webhook_state import (
     merge_chargebee_into_state_file,
@@ -136,6 +137,12 @@ def _schedule_chargebee_full_baseline_merge() -> None:
 def _allow_expansion_on_subscription_created() -> bool:
     raw = (os.getenv("WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def _live_subscription_for_delta_enabled() -> bool:
+    """Use Subscription.retrieve for line quantities (avoids stale/partial webhook JSON). Opt out with 0."""
+    raw = (os.getenv("WEBHOOK_USE_LIVE_SUBSCRIPTION_FOR_DELTA") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _sync_self_service_quantities_from_subscription(
@@ -2177,7 +2184,23 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
     )
 
     exact = _addon_exact_ids_from_env()
-    items = subscription_items_from_webhook_subscription(sub if isinstance(sub, dict) else {})
+    items_webhook = subscription_items_from_webhook_subscription(sub if isinstance(sub, dict) else {})
+    items: list[Any] = list(items_webhook)
+    if _live_subscription_for_delta_enabled():
+        live = subscription_line_dicts_from_chargebee_retrieve(subscription_id)
+        if live is not None and len(live) > 0:
+            items = live
+            log.info(
+                "Delta qtys from Chargebee API retrieve subscription_id=%s (webhook item rows=%s api rows=%s)",
+                subscription_id,
+                len(items_webhook),
+                len(live),
+            )
+        elif live is None:
+            log.warning(
+                "Chargebee Subscription.retrieve failed for %s; using webhook payload for line qtys",
+                subscription_id,
+            )
 
     with _state_lock:
         state = _load_state()
