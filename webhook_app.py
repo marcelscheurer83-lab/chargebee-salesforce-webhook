@@ -130,6 +130,34 @@ def _soql_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+_SF_ID_SUFFIX_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+
+
+def _canonical_salesforce_id(raw: str) -> str:
+    """
+    Normalize a 15- or 18-character Salesforce Id for strict API/SOQL use.
+
+    The last three characters of an 18-char Id are a case checksum over the first 15.
+    Copy/paste or OCR often corrupts them (e.g. ...IAC vs ...IIAR), which yields
+    INVALID_QUERY_FILTER_OPERATOR / invalid ID field.
+    """
+    s = (raw or "").strip()
+    if len(s) < 15:
+        return s
+    base = s[:15]
+    suf = ""
+    for i in range(0, 15, 5):
+        flags = 0
+        for j in range(5):
+            if base[i + j].isupper():
+                flags |= 1 << j
+        suf += _SF_ID_SUFFIX_ALPHABET[flags]
+    full = base + suf
+    if s != full:
+        log.info("Normalized Salesforce Id (checksum fix): %s -> %s", s, full)
+    return full
+
+
 def _valid_sf_field_api_name(name: str) -> bool:
     return bool(name) and bool(re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name))
 
@@ -751,26 +779,35 @@ def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
     Order: SF_PRICEBOOK_ENTRY_ID; else SF_PRICEBOOK2_ID + product; else Standard Price Book + product;
     else any active PricebookEntry for that product (many orgs only add SKUs to a custom catalog).
     """
-    pbe_env = sf_cfg("SF_PRICEBOOK_ENTRY_ID")
+    pbe_env = (sf_cfg("SF_PRICEBOOK_ENTRY_ID") or "").strip()
     if pbe_env:
-        res = sf.query(
-            "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Id = "
-            f"'{_soql_escape(pbe_env)}' LIMIT 1"
-        )
-        recs = res.get("records") or []
-        if recs:
-            return str(recs[0]["Id"]), str(recs[0]["Pricebook2Id"])
-        log.warning("SF_PRICEBOOK_ENTRY_ID not found")
-        return None
+        pbe_canon = _canonical_salesforce_id(pbe_env)
+        try:
+            res = sf.query(
+                "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Id = "
+                f"'{_soql_escape(pbe_canon)}' LIMIT 1"
+            )
+        except Exception as exc:
+            log.warning(
+                "SF_PRICEBOOK_ENTRY_ID lookup failed (%s); trying product-based resolution.",
+                exc,
+            )
+        else:
+            recs = res.get("records") or []
+            if recs:
+                return str(recs[0]["Id"]), str(recs[0]["Pricebook2Id"])
+            log.warning("SF_PRICEBOOK_ENTRY_ID not found")
 
-    prod2 = sf_cfg("SF_PRODUCT2_ID")
+    prod2_raw = sf_cfg("SF_PRODUCT2_ID")
+    prod2 = _canonical_salesforce_id(prod2_raw) if prod2_raw else ""
     if prod2:
         pcond = f"Product2Id = '{_soql_escape(prod2)}'"
     else:
         name = (sf_cfg("SF_PRODUCT_NAME", "Additional CRM Seats") or "Additional CRM Seats").strip()
         pcond = f"Product2.Name = '{_soql_escape(name)}'"
 
-    pb2_cfg = (sf_cfg("SF_PRICEBOOK2_ID") or "").strip()
+    pb2_cfg_raw = (sf_cfg("SF_PRICEBOOK2_ID") or "").strip()
+    pb2_cfg = _canonical_salesforce_id(pb2_cfg_raw) if pb2_cfg_raw else ""
     attempts: list[tuple[str, str]] = []
     if pb2_cfg:
         attempts.append(
