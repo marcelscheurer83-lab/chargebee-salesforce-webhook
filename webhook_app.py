@@ -18,11 +18,12 @@ look like a full delta from zero).
 Delta logic: for each self-serve line key ``subscription_id|item_price_id``, ``stored_qty`` is the
 last known quantity in ``line_quantities``. The webhook payload supplies ``chargebee_qty``; a
 positive expansion is queued only when ``chargebee_qty > stored_qty`` (delta = new - old). Decreases
-update the baseline but do not create an Opportunity.
+update the baseline but do not create an Opportunity. Missing baselines can use Chargebee events
+(``WEBHOOK_INFER_BASELINE_FROM_EVENTS``) to infer prior qty.
 
-After a successful run (or a no-op event), the handler refreshes baselines from this event's payload
-then optionally merges all active subscription lines from the Chargebee API
-(WEBHOOK_MERGE_CHARGEBEE_STATE_ON_WEBHOOK, same as seed_webhook_state / POST /admin/seed-state).
+After a successful run, the handler saves payload-synced baselines, then optionally merges all active
+subscription lines from the Chargebee API in a background thread by default
+(``WEBHOOK_MERGE_CHARGEBEE_ASYNC``) so the HTTP response is not blocked by large Subscription.list walks.
 
 subscription_created (new subscription) refreshes baseline only by default — it does not create an
 expansion for the initial quantities (set WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED=1 to change).
@@ -33,9 +34,10 @@ the latest Closed Won NB/Renewal Opportunity’s ContractId (SF_OPP_AMENDED_CONT
 SF_OPP_POPULATE_CONTRACT_LOOKUP + SOQL sets Opportunity ContractId. After each successful webhook,
 line quantities are synced from the payload, then optionally merged from Chargebee. Prorated Term (Months)
 (SF_USE_PRORATED_TERM_MONTHS) and ServiceDate on lines help match co-termed expansion subscription quotes.
+QuoteLineItem API writes are start/term only when standard/custom line end fields are not writable.
 
-Expansion Opportunity contract end date prefers the same field on the latest Closed Won New Business/Renewal
-as amended Contract (fallback: open Renewal). Optional Chatter post (SF_CHATTER_EXPANSION_*) notifies a user.
+Expansion contract end is still read from the latest Closed Won New Business/Renewal for term math and
+Quote header mapping (``SF_QUOTE_CONTRACT_END_DATE_FIELD``). Optional Chatter post (SF_CHATTER_EXPANSION_*).
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -57,6 +60,7 @@ from simple_salesforce import Salesforce
 from chargebee_client import (
     _addon_exact_ids_from_env,
     _crm_addon_line_matches,
+    infer_prior_self_serve_qty_from_subscription_changed_events,
     self_service_line_state_key,
 )
 from seed_webhook_state import (
@@ -86,33 +90,45 @@ def _merge_chargebee_state_after_webhook_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _merge_chargebee_full_baseline_async_default() -> bool:
+    raw = (os.getenv("WEBHOOK_MERGE_CHARGEBEE_ASYNC") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _schedule_chargebee_full_baseline_merge() -> None:
+    """Merge Chargebee API line qtys into state; slow. Runs in a daemon thread by default."""
+
+    def _run() -> None:
+        try:
+            with _state_lock:
+                st = _load_state()
+                ln: dict[str, int] = dict(st.get("line_quantities") or {})
+                try:
+                    n = merge_chargebee_line_quantities_into_dict(ln)
+                except ValueError as e:
+                    log.warning("Chargebee baseline merge skipped (check CHARGEBEE_* env): %s", e)
+                    return
+                except Exception:
+                    log.exception("Chargebee baseline merge failed")
+                    return
+                st["line_quantities"] = ln
+                _save_state(st)
+            log.info(
+                "Merged %s self-serve subscription lines from Chargebee API into state baseline",
+                n,
+            )
+        except Exception:
+            log.exception("Chargebee baseline merge state write failed")
+
+    if _merge_chargebee_full_baseline_async_default():
+        threading.Thread(target=_run, daemon=True).start()
+    else:
+        _run()
+
+
 def _allow_expansion_on_subscription_created() -> bool:
     raw = (os.getenv("WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
-
-
-def _apply_baseline_refresh_from_event(
-    items: list[Any],
-    lines: dict[str, int],
-    subscription_id: str,
-    exact: frozenset[str] | None,
-) -> None:
-    """Update ``lines`` from this webhook's payload, then optionally merge all subs from Chargebee API."""
-    _sync_self_service_quantities_from_subscription(items, lines, subscription_id, exact)
-    if not _merge_chargebee_state_after_webhook_enabled():
-        return
-    try:
-        n_cb = merge_chargebee_line_quantities_into_dict(lines)
-        log.info(
-            "Merged %s self-serve subscription lines from Chargebee API into state baseline",
-            n_cb,
-        )
-    except ValueError as e:
-        log.warning("Chargebee baseline merge skipped (check CHARGEBEE_* env): %s", e)
-    except Exception:
-        log.exception(
-            "Chargebee baseline merge failed; continuing with payload-synced quantities only"
-        )
 
 
 def _sync_self_service_quantities_from_subscription(
@@ -336,16 +352,21 @@ def _prorated_term_months(start: date, end: date) -> float:
     """
     Fractional months from calendar day span (matches common CPQ co-term math: days / (365.25/12)).
     E.g. 364 days ≈ 11.97 months — aligns manual expansion quotes where Term (Months) is decimal.
+
+    When QuoteLineItem End Date is derived from Start Date + Term in Salesforce, low rounding (e.g. 2
+    decimals) can land one calendar day short of ``end``. Use ``SF_PRORATED_TERM_DECIMALS`` (default 6,
+    max 12) so the stored term matches the day span more closely. Ensure the Term field in Salesforce
+    has enough decimal places to accept the precision you send.
     """
     if end <= start:
         return 0.0
     days = (end - start).days
     months = days / (365.25 / 12.0)
     try:
-        nd = int((sf_cfg("SF_PRORATED_TERM_DECIMALS") or "2").strip() or "2")
+        nd = int((sf_cfg("SF_PRORATED_TERM_DECIMALS") or "6").strip() or "6")
     except ValueError:
-        nd = 2
-    nd = max(0, min(6, nd))
+        nd = 6
+    nd = max(0, min(12, nd))
     return round(months, nd)
 
 
@@ -357,20 +378,6 @@ def _expansion_term_months(sync_date: date, contract_end: date | None) -> float 
         return _prorated_term_months(sync_date, contract_end)
     cal = _months_between_start_and_end(sync_date, contract_end)
     return float(cal) if cal > 0 else None
-
-
-def _line_item_end_date_from_contract(contract_end: date) -> date:
-    """
-    Optional calendar offset for quote line End Date fields vs canonical contract end.
-
-    Use 0 so Opportunity, Quote header, and Quote line ends all match the Closed Won NB/Renewal
-    contract end. A non-zero offset (e.g. -1) makes lines one day earlier than the header.
-    """
-    try:
-        off = int((sf_cfg("SF_OLI_END_DATE_OFFSET_DAYS") or "0").strip() or "0")
-    except ValueError:
-        off = 0
-    return contract_end + timedelta(days=off)
 
 
 def _opportunity_mrr_field_updates(amount: float | None) -> dict[str, float]:
@@ -536,6 +543,29 @@ def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) 
 
 def _truthy_cfg(key: str) -> bool:
     return (sf_cfg(key) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _infer_baseline_from_chargebee_events_enabled() -> bool:
+    raw = (os.getenv("WEBHOOK_INFER_BASELINE_FROM_EVENTS") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _events_baseline_scan_limit() -> int:
+    raw = (os.getenv("WEBHOOK_EVENTS_BASELINE_SCAN_LIMIT") or "100").strip()
+    try:
+        return max(10, min(int(raw), 500))
+    except ValueError:
+        return 100
+
+
+def _finalize_ql_dates_sleep_sec() -> float:
+    raw = (os.getenv("WEBHOOK_FINALIZE_QLI_DATES_SLEEP_SEC") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, min(float(raw), 30.0))
+    except ValueError:
+        return 0.0
 
 
 def _resolve_sf_contract_id_for_account(
@@ -812,9 +842,6 @@ def _create_expansion_opportunity(
     start_f = sf_cfg("SF_OPP_CONTRACT_START_DATE_FIELD")
     if start_f and _valid_sf_field_api_name(start_f):
         body[start_f] = _sf_date_payload(sync_date)
-    end_f = sf_cfg("SF_OPP_CONTRACT_END_DATE_FIELD")
-    if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
-        body[end_f] = _sf_date_payload(contract_end)
     term_f = sf_cfg("SF_OPP_TERM_MONTHS_FIELD")
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         body[term_f] = float(term_months)
@@ -1016,18 +1043,14 @@ def _ensure_opportunity_pricebook(sf: Salesforce, opp_id: str, pb2_id: str) -> b
 def _product_line_custom_fields(
     *,
     sync_date: date,
-    contract_end: date | None,
     term_months: float | None,
 ) -> dict[str, Any]:
-    """Optional custom fields for QuoteLineItem (SF_OLI_* env names kept for backward compatibility)."""
+    """QuoteLineItem custom start/term (SF_OLI_*). End-date fields are omitted when the org denies API write."""
     out: dict[str, Any] = {}
     start_f = sf_cfg("SF_OLI_START_DATE_FIELD")
-    end_f = sf_cfg("SF_OLI_END_DATE_FIELD")
     term_f = sf_cfg("SF_OLI_TERM_MONTHS_FIELD")
     if start_f and _valid_sf_field_api_name(start_f):
         out[start_f] = _sf_date_payload(sync_date)
-    if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
-        out[end_f] = _sf_date_payload(_line_item_end_date_from_contract(contract_end))
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         out[term_f] = float(term_months)
     return out
@@ -1093,10 +1116,6 @@ def _merge_quote_header_custom_fields(
             oli_s = sf_cfg("SF_OLI_START_DATE_FIELD")
             if oli_s and _valid_sf_field_api_name(oli_s):
                 body[oli_s] = _sf_date_payload(sync_date)
-        if not end_f and contract_end is not None:
-            oli_e = sf_cfg("SF_OLI_END_DATE_FIELD")
-            if oli_e and _valid_sf_field_api_name(oli_e):
-                body[oli_e] = _sf_date_payload(contract_end)
         if not term_f and term_months is not None:
             oli_t = sf_cfg("SF_OLI_TERM_MONTHS_FIELD")
             if oli_t and _valid_sf_field_api_name(oli_t):
@@ -1538,28 +1557,15 @@ def _create_expansion_quote(
     return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
 
 
-def _patch_quotelineitem_contract_dates(
+def _patch_quotelineitem_start_and_term(
     sf: Salesforce,
     qli_id: str,
     *,
     sync_date: date,
-    contract_end: date | None,
     term_months: float | None,
 ) -> None:
-    """
-    After QuoteLineItem.create, set custom End_Date__c / Term / Start to match the Quote header and Won opp.
-
-    Some orgs reject End_Date__c on insert (FLS/validation); create then drops the field and Salesforce
-    may default line End Date one day early. This update aligns the line with contract_end exactly.
-    """
-    if contract_end is None:
-        return
+    """After QuoteLineItem.create, align start/term only (end-date API writes skipped for restricted orgs)."""
     patch: dict[str, Any] = {}
-    end_f = sf_cfg("SF_OLI_END_DATE_FIELD")
-    if end_f and _valid_sf_field_api_name(end_f):
-        patch[end_f] = _sf_date_payload(contract_end)
-    # Standard EndDate aligns line with header when the org exposes it; 400 retry drops if not.
-    patch["EndDate"] = contract_end.isoformat()
     term_f = sf_cfg("SF_OLI_TERM_MONTHS_FIELD")
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         patch[term_f] = float(term_months)
@@ -1568,22 +1574,92 @@ def _patch_quotelineitem_contract_dates(
         patch[start_f] = _sf_date_payload(sync_date)
     if not patch:
         return
+    planned = frozenset(patch.keys())
     ok, err = _sf_update_with_400_retries(
         sf,
         update_callable=sf.QuoteLineItem.update,
         record_id=qli_id,
-        patch=dict(patch),
-        retry_label="QuoteLineItem.update (contract dates)",
+        patch=patch,
+        retry_label="QuoteLineItem.update (start/term)",
     )
     if ok:
-        log.info("Patched QuoteLineItem %s contract dates: %s", qli_id, sorted(patch.keys()))
+        accepted = frozenset(patch.keys())
+        dropped = planned - accepted
+        log.info("Patched QuoteLineItem %s (fields accepted): %s", qli_id, sorted(accepted))
+        if dropped:
+            log.warning(
+                "QuoteLineItem %s: Salesforce rejected fields %s on update.",
+                qli_id,
+                sorted(dropped),
+            )
     elif err:
         log.warning(
-            "QuoteLineItem contract date patch incomplete for %s (grant FLS on %s): %s",
+            "QuoteLineItem update incomplete for %s (grant FLS on %s): %s",
             qli_id,
             ", ".join(sorted(patch.keys())),
             err,
         )
+
+
+def _log_quotelineitem_end_dates_after_finalize(sf: Salesforce, quote_id: str) -> None:
+    qid = _canonical_salesforce_id(quote_id)
+    end_f = sf_cfg("SF_OLI_END_DATE_FIELD")
+    fields = "Id, EndDate"
+    if end_f and _valid_sf_field_api_name(end_f):
+        fields += f", {end_f}"
+    try:
+        res = sf.query(
+            f"SELECT {fields} FROM QuoteLineItem WHERE QuoteId = '{_soql_escape(qid)}' LIMIT 80"
+        )
+    except Exception:
+        log.exception("QuoteLineItem post-finalize date readback failed quote=%s", qid)
+        return
+    parts: list[str] = []
+    for r in res.get("records") or []:
+        rid = r.get("Id")
+        ed = r.get("EndDate")
+        if end_f:
+            parts.append(f"{rid}:EndDate={ed},{end_f}={r.get(end_f)}")
+        else:
+            parts.append(f"{rid}:EndDate={ed}")
+    if parts:
+        log.info("QuoteLineItem dates after sync+finalize on quote %s: %s", qid, "; ".join(parts))
+
+
+def _finalize_expansion_quotelineitem_contract_dates(
+    sf: Salesforce,
+    quote_id: str,
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: float | None,
+) -> None:
+    qid = _canonical_salesforce_id(quote_id)
+    try:
+        res = sf.query(
+            f"SELECT Id FROM QuoteLineItem WHERE QuoteId = '{_soql_escape(qid)}'"
+        )
+    except Exception:
+        log.exception("Finalize QLI: list QuoteLineItem Ids failed quote=%s", qid)
+        return
+    ids = [str(r["Id"]) for r in (res.get("records") or []) if r.get("Id")]
+    if not ids:
+        return
+    delay = _finalize_ql_dates_sleep_sec()
+    if delay > 0:
+        log.info(
+            "Sleep %.2fs before final QuoteLineItem date patch (WEBHOOK_FINALIZE_QLI_DATES_SLEEP_SEC)",
+            delay,
+        )
+        time.sleep(delay)
+    for qli_id in ids:
+        _patch_quotelineitem_start_and_term(
+            sf,
+            qli_id,
+            sync_date=sync_date,
+            term_months=term_months,
+        )
+    _log_quotelineitem_end_dates_after_finalize(sf, qid)
 
 
 def _skip_expansion_when_baseline_missing() -> bool:
@@ -1620,9 +1696,7 @@ def _add_quote_line_items(
     term_months: float | None,
 ) -> None:
     """One QuoteLineItem per Chargebee line; Quantity = seat delta for this event."""
-    extras = _product_line_custom_fields(
-        sync_date=sync_date, contract_end=contract_end, term_months=term_months
-    )
+    extras = _product_line_custom_fields(sync_date=sync_date, term_months=term_months)
     qli_static = _quotelineitem_extra_fields_from_config()
     for _key, _new_qty, delta, ip_id, up in pending:
         if delta <= 0:
@@ -1640,8 +1714,6 @@ def _add_quote_line_items(
             body["Description"] = desc
         if _truthy_cfg("SF_QTI_SET_STANDARD_SERVICE_DATE"):
             body["ServiceDate"] = sync_date.isoformat()
-        if contract_end is not None and _truthy_cfg("SF_QTI_SET_STANDARD_END_DATE"):
-            body["EndDate"] = _line_item_end_date_from_contract(contract_end).isoformat()
         if up is not None:
             body["UnitPrice"] = round(up, 2)
             line_mrr = round(float(up) * float(delta), 2)
@@ -1665,11 +1737,10 @@ def _add_quote_line_items(
                     ip_id,
                 )
                 if qli_id:
-                    _patch_quotelineitem_contract_dates(
+                    _patch_quotelineitem_start_and_term(
                         sf,
                         qli_id,
                         sync_date=sync_date,
-                        contract_end=contract_end,
                         term_months=term_months,
                     )
                 li_ok = True
@@ -1799,6 +1870,13 @@ def _attach_expansion_quote_and_lines(
     )
     _patch_quote_financials_after_line_items(sf, qid, amount=amount)
     _try_set_quote_syncing(sf, opp_id, qid)
+    _finalize_expansion_quotelineitem_contract_dates(
+        sf,
+        qid,
+        sync_date=sync_date,
+        contract_end=contract_end,
+        term_months=term_months,
+    )
 
 
 def _check_basic_auth() -> bool:
@@ -1849,166 +1927,198 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             return
 
         lines: dict[str, int] = dict(state.get("line_quantities") or {})
+        defer_full_chargebee_merge = False
 
         if event_type == "subscription_created" and not _allow_expansion_on_subscription_created():
-            _apply_baseline_refresh_from_event(items, lines, subscription_id, exact)
+            _sync_self_service_quantities_from_subscription(items, lines, subscription_id, exact)
             processed.append(event_id)
-            state["processed_event_ids"] = _trim_processed_ids(processed)
-            state["line_quantities"] = lines
-            _save_state(state)
             log.info(
                 "subscription_created %s: baseline updated; expansion skipped "
                 "(WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED is off)",
                 subscription_id,
             )
-            return
+            defer_full_chargebee_merge = _merge_chargebee_state_after_webhook_enabled()
+        else:
+            pending: list[tuple[str, int, int, str, float | None]] = []
+            # pending: (line_key, new_qty, delta, item_price_id, unit_price_major)
+            missing_baseline_warned = False
 
-        pending: list[tuple[str, int, int, str, float | None]] = []
-        # pending: (line_key, new_qty, delta, item_price_id, unit_price_major)
-        missing_baseline_warned = False
-
-        for si in items:
-            if not isinstance(si, dict):
-                continue
-            ip_id = si.get("item_price_id")
-            itype = si.get("item_type")
-            if not _crm_addon_line_matches(
-                str(ip_id) if ip_id else None,
-                str(itype) if itype else None,
-                exact,
-            ):
-                continue
-            qty_raw = si.get("quantity")
-            try:
-                new_qty = int(qty_raw) if qty_raw is not None else 0
-            except (TypeError, ValueError):
-                new_qty = 0
-            key = self_service_line_state_key(subscription_id, str(ip_id))
-            stored = lines.get(key)
-            old_qty = 0 if stored is None else stored
-            if stored is None and new_qty > 0 and not missing_baseline_warned:
-                missing_baseline_warned = True
-                log.warning(
-                    "No stored baseline for self-serve line %s; treating prior qty as 0 for this delta. "
-                    "If you just redeployed, seed WEBHOOK_STATE_PATH (POST /admin/seed-state or "
-                    "seed_webhook_state.py) so the next increase is only the real delta. "
-                    "Or set WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING=1 to block expansion until seeded.",
-                    key,
-                )
-            if stored is None and _skip_expansion_when_baseline_missing():
-                if new_qty > old_qty:
-                    log.error(
-                        "Skipping expansion for line %s (Chargebee qty=%s): "
-                        "WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING is on and state has no baseline.",
+            for si in items:
+                if not isinstance(si, dict):
+                    continue
+                ip_id = si.get("item_price_id")
+                itype = si.get("item_type")
+                if not _crm_addon_line_matches(
+                    str(ip_id) if ip_id else None,
+                    str(itype) if itype else None,
+                    exact,
+                ):
+                    continue
+                qty_raw = si.get("quantity")
+                try:
+                    new_qty = int(qty_raw) if qty_raw is not None else 0
+                except (TypeError, ValueError):
+                    new_qty = 0
+                key = self_service_line_state_key(subscription_id, str(ip_id))
+                stored = lines.get(key)
+                inferred: int | None = None
+                if stored is None and _infer_baseline_from_chargebee_events_enabled():
+                    try:
+                        inferred = infer_prior_self_serve_qty_from_subscription_changed_events(
+                            subscription_id,
+                            str(ip_id),
+                            new_qty,
+                            event_id,
+                            max_events=_events_baseline_scan_limit(),
+                        )
+                    except Exception:
+                        log.exception(
+                            "Chargebee events baseline infer failed key=%s; continuing without infer",
+                            key,
+                        )
+                        inferred = None
+                if stored is not None:
+                    old_qty = stored
+                elif inferred is not None:
+                    old_qty = inferred
+                    log.info(
+                        "Inferred prior qty from Chargebee events for %s: %s (current %s)",
                         key,
+                        inferred,
                         new_qty,
                     )
-                continue
-            if new_qty <= old_qty:
-                continue
-
-            delta = new_qty - old_qty
-            up = _unit_price_major(si, currency)
-            log.info(
-                "Self-serve line item_price_id=%s stored_qty=%s chargebee_qty=%s delta_qty=%s",
-                ip_id,
-                old_qty,
-                new_qty,
-                delta,
-            )
-            pending.append((key, new_qty, delta, str(ip_id), up))
-
-        mark_processed = True
-        if pending:
-            sf = _get_salesforce()
-            account_id = _resolve_account_id(sf, customer, customer_id)
-            if account_id:
-                contract_id = None
-                if _truthy_cfg("SF_OPP_POPULATE_CONTRACT_LOOKUP"):
-                    contract_id = _resolve_sf_contract_id_for_account(sf, account_id, sync_date, sub)
-                amended_contract_id = _query_amended_contract_from_won_opportunities(sf, account_id)
-
-                skip_expansion = False
-                if _truthy_cfg("SF_OPP_CONTRACT_LOOKUP_REQUIRED") and not contract_id:
-                    log.error(
-                        "Skipping expansion Opportunity: SF_OPP_CONTRACT_LOOKUP_REQUIRED but no Contract "
-                        "resolved for Account %s (enable SF_OPP_POPULATE_CONTRACT_LOOKUP and SOQL filters).",
-                        account_id,
-                    )
-                    skip_expansion = True
-                if _truthy_cfg("SF_OPP_AMENDED_CONTRACT_REQUIRED") and not amended_contract_id:
-                    log.error(
-                        "Skipping expansion Opportunity: SF_OPP_AMENDED_CONTRACT_REQUIRED but no Closed Won "
-                        "New Business/Renewal with ContractId for Account %s (check record type DeveloperNames).",
-                        account_id,
-                    )
-                    skip_expansion = True
-                if skip_expansion:
-                    mark_processed = False
                 else:
-                    total_delta = sum(p[2] for p in pending)
-                    amount: float | None = None
-                    parts: list[str] = [
-                        f"Chargebee self-serve CRM seat increases (total +{total_delta} seats).",
-                        f"customer_id={customer_id}",
-                        f"subscription_id={subscription_id}",
-                        f"chargebee_event_id={event_id}",
-                        "",
-                    ]
-                    amt_sum = 0.0
-                    any_price = False
-                    for key, _new_qty, delta, ip_id, up in pending:
-                        parts.append(f"item_price_id={ip_id}  +{delta} seats")
-                        if up is not None:
-                            any_price = True
-                            amt_sum += up * delta
-                    if any_price:
-                        amount = amt_sum
-                    desc = "\n".join(parts)
-                    contract_end = _query_expansion_contract_end_from_won_opportunities(sf, account_id)
-                    if contract_end is None:
-                        contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
-                    term_months = _expansion_term_months(sync_date, contract_end)
-                    oid = _create_expansion_opportunity(
-                        sf,
-                        company=company,
-                        account_id=account_id,
-                        customer_id=customer_id,
-                        subscription_id=subscription_id,
-                        event_id=event_id,
-                        total_seat_delta=total_delta,
-                        description=desc,
-                        amount=amount,
-                        sync_date=sync_date,
-                        contract_end=contract_end,
-                        term_months=term_months,
-                        contract_id=contract_id,
-                        amended_contract_id=amended_contract_id,
+                    old_qty = 0
+                if stored is None and inferred is None and new_qty > 0 and not missing_baseline_warned:
+                    missing_baseline_warned = True
+                    log.warning(
+                        "No stored baseline for self-serve line %s; treating prior qty as 0 for this delta. "
+                        "If you just redeployed, seed WEBHOOK_STATE_PATH (POST /admin/seed-state or "
+                        "seed_webhook_state.py) so the next increase is only the real delta. "
+                        "Or set WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING=1 to block expansion until seeded.",
+                        key,
                     )
-                    log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
-                    _attach_expansion_quote_and_lines(
-                        sf,
-                        oid,
-                        company=company or customer_id,
-                        total_seat_delta=total_delta,
-                        pending=pending,
-                        sync_date=sync_date,
-                        contract_end=contract_end,
-                        term_months=term_months,
-                        amount=amount,
-                    )
-                    _update_opportunity_mrr_after_products(sf, oid, amount)
-                    _post_expansion_opportunity_chatter(sf, oid)
-            else:
-                log.warning("Skipping Opportunity: no Salesforce Account for customer_id=%s", customer_id)
-                mark_processed = False
+                if stored is None and inferred is None and _skip_expansion_when_baseline_missing():
+                    if new_qty > old_qty:
+                        log.error(
+                            "Skipping expansion for line %s (Chargebee qty=%s): "
+                            "WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING is on and state has no baseline.",
+                            key,
+                            new_qty,
+                        )
+                    continue
+                if new_qty <= old_qty:
+                    continue
 
-        if mark_processed:
-            _apply_baseline_refresh_from_event(items, lines, subscription_id, exact)
-            processed.append(event_id)
+                delta = new_qty - old_qty
+                up = _unit_price_major(si, currency)
+                log.info(
+                    "Self-serve line item_price_id=%s stored_qty=%s chargebee_qty=%s delta_qty=%s",
+                    ip_id,
+                    old_qty,
+                    new_qty,
+                    delta,
+                )
+                pending.append((key, new_qty, delta, str(ip_id), up))
+
+            mark_processed = True
+            if pending:
+                sf = _get_salesforce()
+                account_id = _resolve_account_id(sf, customer, customer_id)
+                if account_id:
+                    contract_id = None
+                    if _truthy_cfg("SF_OPP_POPULATE_CONTRACT_LOOKUP"):
+                        contract_id = _resolve_sf_contract_id_for_account(sf, account_id, sync_date, sub)
+                    amended_contract_id = _query_amended_contract_from_won_opportunities(sf, account_id)
+
+                    skip_expansion = False
+                    if _truthy_cfg("SF_OPP_CONTRACT_LOOKUP_REQUIRED") and not contract_id:
+                        log.error(
+                            "Skipping expansion Opportunity: SF_OPP_CONTRACT_LOOKUP_REQUIRED but no Contract "
+                            "resolved for Account %s (enable SF_OPP_POPULATE_CONTRACT_LOOKUP and SOQL filters).",
+                            account_id,
+                        )
+                        skip_expansion = True
+                    if _truthy_cfg("SF_OPP_AMENDED_CONTRACT_REQUIRED") and not amended_contract_id:
+                        log.error(
+                            "Skipping expansion Opportunity: SF_OPP_AMENDED_CONTRACT_REQUIRED but no Closed Won "
+                            "New Business/Renewal with ContractId for Account %s (check record type DeveloperNames).",
+                            account_id,
+                        )
+                        skip_expansion = True
+                    if skip_expansion:
+                        mark_processed = False
+                    else:
+                        total_delta = sum(p[2] for p in pending)
+                        amount: float | None = None
+                        parts: list[str] = [
+                            f"Chargebee self-serve CRM seat increases (total +{total_delta} seats).",
+                            f"customer_id={customer_id}",
+                            f"subscription_id={subscription_id}",
+                            f"chargebee_event_id={event_id}",
+                            "",
+                        ]
+                        amt_sum = 0.0
+                        any_price = False
+                        for key, _new_qty, delta, ip_id, up in pending:
+                            parts.append(f"item_price_id={ip_id}  +{delta} seats")
+                            if up is not None:
+                                any_price = True
+                                amt_sum += up * delta
+                        if any_price:
+                            amount = amt_sum
+                        desc = "\n".join(parts)
+                        contract_end = _query_expansion_contract_end_from_won_opportunities(sf, account_id)
+                        if contract_end is None:
+                            contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
+                        term_months = _expansion_term_months(sync_date, contract_end)
+                        oid = _create_expansion_opportunity(
+                            sf,
+                            company=company,
+                            account_id=account_id,
+                            customer_id=customer_id,
+                            subscription_id=subscription_id,
+                            event_id=event_id,
+                            total_seat_delta=total_delta,
+                            description=desc,
+                            amount=amount,
+                            sync_date=sync_date,
+                            contract_end=contract_end,
+                            term_months=term_months,
+                            contract_id=contract_id,
+                            amended_contract_id=amended_contract_id,
+                        )
+                        log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
+                        _attach_expansion_quote_and_lines(
+                            sf,
+                            oid,
+                            company=company or customer_id,
+                            total_seat_delta=total_delta,
+                            pending=pending,
+                            sync_date=sync_date,
+                            contract_end=contract_end,
+                            term_months=term_months,
+                            amount=amount,
+                        )
+                        _update_opportunity_mrr_after_products(sf, oid, amount)
+                        _post_expansion_opportunity_chatter(sf, oid)
+                else:
+                    log.warning("Skipping Opportunity: no Salesforce Account for customer_id=%s", customer_id)
+                    mark_processed = False
+
+            if mark_processed:
+                _sync_self_service_quantities_from_subscription(items, lines, subscription_id, exact)
+                processed.append(event_id)
+            defer_full_chargebee_merge = bool(
+                mark_processed and _merge_chargebee_state_after_webhook_enabled()
+            )
+
         state["processed_event_ids"] = _trim_processed_ids(processed)
         state["line_quantities"] = lines
         _save_state(state)
+
+    if defer_full_chargebee_merge:
+        _schedule_chargebee_full_baseline_merge()
 
 
 @app.post("/chargebee")

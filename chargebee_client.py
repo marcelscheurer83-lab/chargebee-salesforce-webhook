@@ -251,6 +251,81 @@ def _item_price_to_row(ip: Any) -> list:
     ]
 
 
+def _subscription_addon_quantity_from_payload(sub: Any, item_price_id: str) -> int | None:
+    """Quantity for ``item_price_id`` on a subscription dict (webhook/API shape). ``None`` if wrong sub."""
+    if not isinstance(sub, dict):
+        return None
+    items = sub.get("subscription_items") or sub.get("subscription_items_list") or []
+    if not isinstance(items, list):
+        return None
+    for si in items:
+        if not isinstance(si, dict):
+            continue
+        if str(si.get("item_price_id") or "") != item_price_id:
+            continue
+        qty_raw = si.get("quantity")
+        try:
+            return int(qty_raw) if qty_raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def infer_prior_self_serve_qty_from_subscription_changed_events(
+    subscription_id: str,
+    item_price_id: str,
+    new_qty: int,
+    current_event_id: str | None = None,
+    *,
+    client: Chargebee | None = None,
+    max_events: int = 100,
+) -> int | None:
+    """
+    When webhook state has no baseline, walk recent ``subscription_changed`` events (newest first)
+    and return the quantity for ``item_price_id`` from the first older snapshot where qty < ``new_qty``.
+
+    Chargebee's List Events API cannot filter by subscription id; this scans the newest ``max_events``
+    site-wide events and skips payloads for other subscriptions.
+    """
+    if not subscription_id or not item_price_id or new_qty <= 0:
+        return None
+    cap = max(10, min(int(max_events), 500))
+    if client is None:
+        client = get_client()
+    try:
+        response = client.Event.list(
+            {
+                "limit": cap,
+                "event_type": {"IS": "subscription_changed"},
+                "sort_by": {"DESC": "occurred_at"},
+            }
+        )
+    except Exception:
+        return None
+    rows = getattr(response, "list", None) or []
+    for row in rows:
+        ev = getattr(row, "event", None)
+        if ev is None:
+            continue
+        eid = getattr(ev, "id", None)
+        if current_event_id and eid is not None and str(eid) == str(current_event_id):
+            continue
+        content = getattr(ev, "content", None)
+        if content is None and isinstance(getattr(ev, "raw_data", None), dict):
+            content = ev.raw_data.get("content")
+        if not isinstance(content, dict):
+            continue
+        sub = content.get("subscription") or {}
+        if str(sub.get("id") or "") != subscription_id:
+            continue
+        prev = _subscription_addon_quantity_from_payload(sub, item_price_id)
+        if prev is None:
+            continue
+        if prev < new_qty:
+            return prev
+    return None
+
+
 def fetch_item_prices(client: Chargebee | None = None) -> list[list]:
     """
     List all item prices from Chargebee (includes add-ons).

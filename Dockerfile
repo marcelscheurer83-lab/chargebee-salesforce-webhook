@@ -19,4 +19,5 @@ COPY salesforce_field_map.example.json ./
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["sh", "-c", "exec gunicorn -w 1 -b 0.0.0.0:${PORT:-8080} webhook_app:app"]
+# Long timeout: Salesforce + optional sync; Chargebee full baseline merge runs async by default.
+CMD ["sh", "-c", "exec gunicorn -w 1 -t 120 -b 0.0.0.0:${PORT:-8080} webhook_app:app"]
