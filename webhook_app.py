@@ -745,7 +745,12 @@ def _update_opportunity_mrr_after_products(
 
 
 def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
-    """Return (PricebookEntryId, Pricebook2Id) for quote / product lines."""
+    """
+    Return (PricebookEntryId, Pricebook2Id) for quote / product lines.
+
+    Order: SF_PRICEBOOK_ENTRY_ID; else SF_PRICEBOOK2_ID + product; else Standard Price Book + product;
+    else any active PricebookEntry for that product (many orgs only add SKUs to a custom catalog).
+    """
     pbe_env = sf_cfg("SF_PRICEBOOK_ENTRY_ID")
     if pbe_env:
         res = sf.query(
@@ -760,25 +765,50 @@ def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
 
     prod2 = sf_cfg("SF_PRODUCT2_ID")
     if prod2:
-        q = (
-            "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Product2Id = "
-            f"'{_soql_escape(prod2)}' AND Pricebook2.IsStandard = true AND IsActive = true LIMIT 1"
-        )
+        pcond = f"Product2Id = '{_soql_escape(prod2)}'"
     else:
         name = (sf_cfg("SF_PRODUCT_NAME", "Additional CRM Seats") or "Additional CRM Seats").strip()
-        q = (
-            "SELECT Id, Pricebook2Id FROM PricebookEntry WHERE Product2.Name = "
-            f"'{_soql_escape(name)}' AND Pricebook2.IsStandard = true AND IsActive = true LIMIT 1"
+        pcond = f"Product2.Name = '{_soql_escape(name)}'"
+
+    pb2_cfg = (sf_cfg("SF_PRICEBOOK2_ID") or "").strip()
+    attempts: list[tuple[str, str]] = []
+    if pb2_cfg:
+        attempts.append(
+            (
+                f"{pcond} AND Pricebook2Id = '{_soql_escape(pb2_cfg)}' AND IsActive = true",
+                f"SF_PRICEBOOK2_ID={pb2_cfg}",
+            )
         )
-    res = sf.query(q)
-    recs = res.get("records") or []
-    if not recs:
-        log.warning(
-            "No standard PricebookEntry for expansion product — set SF_PRODUCT_NAME (default "
-            "'Additional CRM Seats'), SF_PRODUCT2_ID, or SF_PRICEBOOK_ENTRY_ID"
+    attempts.append(
+        (f"{pcond} AND Pricebook2.IsStandard = true AND IsActive = true", "standard price book")
+    )
+    attempts.append((f"{pcond} AND IsActive = true", "first active price book (non-standard ok)"))
+
+    for where_extra, label in attempts:
+        order = (
+            " ORDER BY CreatedDate DESC"
+            if label == "first active price book (non-standard ok)"
+            else ""
         )
-        return None
-    return str(recs[0]["Id"]), str(recs[0]["Pricebook2Id"])
+        q = f"SELECT Id, Pricebook2Id FROM PricebookEntry WHERE {where_extra}{order} LIMIT 1"
+        try:
+            res = sf.query(q)
+        except Exception:
+            log.exception("PricebookEntry lookup failed (%s)", label)
+            continue
+        recs = res.get("records") or []
+        if recs:
+            pbe_id = str(recs[0]["Id"])
+            pb_id = str(recs[0]["Pricebook2Id"])
+            if label != "standard price book":
+                log.info("Resolved PricebookEntry via %s — use SF_PRICEBOOK_ENTRY_ID or SF_PRICEBOOK2_ID to pin this.", label)
+            return pbe_id, pb_id
+
+    log.warning(
+        "No active PricebookEntry for expansion product — set SF_PRICEBOOK_ENTRY_ID (01u…), or "
+        "SF_PRODUCT2_ID / SF_PRODUCT_NAME with SF_PRICEBOOK2_ID if the SKU is not on the Standard Price Book."
+    )
+    return None
 
 
 def _ensure_opportunity_pricebook(sf: Salesforce, opp_id: str, pb2_id: str) -> bool:
