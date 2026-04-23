@@ -995,8 +995,9 @@ def _merge_quote_financial_header_fields(body: dict[str, Any], amount: float | N
 
 def _quotelineitem_extra_fields_from_config() -> dict[str, Any]:
     """
-    Optional JSON object merged into each QuoteLineItem create (e.g. subscription / price-basis picklists
-    that mirror your “Add Products” wizard). Keys must be valid API names; values must match picklist API values.
+    Optional JSON object merged into each QuoteLineItem create (e.g. subscription / price-basis picklists,
+    checkboxes such as isARR__c, or fields your “Add Products” wizard sets). Keys must be valid API names;
+    values must match picklist API values or booleans for checkboxes.
     """
     raw = (sf_cfg("SF_QUOTELINEITEM_STATIC_FIELDS_JSON") or "").strip()
     if not raw:

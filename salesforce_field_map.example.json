@@ -28,6 +28,7 @@
   "SF_USE_PRORATED_TERM_MONTHS": "true",
   "SF_OLI_END_DATE_OFFSET_DAYS": "-1",
   "SF_QTI_SET_STANDARD_SERVICE_DATE": "true",
+  "SF_QUOTELINEITEM_STATIC_FIELDS_JSON": "{\"isARR__c\":true}",
   "SF_QTI_DESCRIPTION_TEMPLATE": "{product_name} — +{delta} CRM self-serve seats ({item_price_id})",
   "SF_EVENT_TIMEZONE": "America/New_York"
 }
