@@ -22,8 +22,9 @@ first increase is computed before this merge, so a cold start can still treat th
 as delta unless you seeded or use a persistent volume with prior quantities.
 
 Products: always creates a Quote on the expansion Opportunity and adds QuoteLineItems (seat delta qty).
-After each successfully processed webhook, self-serve line quantities are synced from the payload,
-then optionally merged from the Chargebee API (see above).
+Map SF_QUOTE_MRR_FIELD / SF_QUOTE_ARR_FIELD / SF_QUOTE_ONETIME_FEES_FIELD for header revenue; optional
+SF_QUOTELINEITEM_STATIC_FIELDS_JSON for line-level charge-type fields. After each successful webhook,
+line quantities are synced from the payload, then optionally merged from the Chargebee API (see above).
 """
 
 from __future__ import annotations
@@ -680,6 +681,15 @@ def _merge_quote_header_custom_fields(
         ar_v = _sf_quote_autorenew_payload()
         if ar_v is not None:
             body[ar_f] = ar_v
+    _merge_quote_financial_header_fields(body, amount)
+
+
+def _merge_quote_financial_header_fields(body: dict[str, Any], amount: float | None) -> None:
+    """
+    Quote header: MRR/ARR from delta seat revenue (Chargebee unit price × delta qty).
+    Optional SF_QUOTE_ONETIME_FEES_FIELD set to 0 when the org stores one-time total there
+    (often a manual or rollup field; formula/read-only fields are dropped on retry).
+    """
     if amount is not None:
         mrr_f = sf_cfg("SF_QUOTE_MRR_FIELD")
         if mrr_f and _valid_sf_field_api_name(mrr_f):
@@ -687,6 +697,31 @@ def _merge_quote_header_custom_fields(
         arr_f = sf_cfg("SF_QUOTE_ARR_FIELD")
         if arr_f and _valid_sf_field_api_name(arr_f):
             body[arr_f] = round(float(amount) * 12.0, 2)
+    otf = sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD")
+    if otf and _valid_sf_field_api_name(otf):
+        body[otf] = 0.0
+
+
+def _quotelineitem_extra_fields_from_config() -> dict[str, Any]:
+    """
+    Optional JSON object merged into each QuoteLineItem create (e.g. charge type / recurring picklist).
+    SF_QUOTELINEITEM_STATIC_FIELDS_JSON='{"Some_Field__c":"Recurring"}' — keys must be valid API names.
+    """
+    raw = (sf_cfg("SF_QUOTELINEITEM_STATIC_FIELDS_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("SF_QUOTELINEITEM_STATIC_FIELDS_JSON is not valid JSON; ignored")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and _valid_sf_field_api_name(k):
+            out[k] = v
+    return out
 
 
 def _patch_quote_header_after_create(
@@ -743,6 +778,56 @@ def _patch_quote_header_after_create(
     if last_exc:
         log.warning(
             "Quote header patch incomplete for %s (wrong API names, FLS, or formula fields). Last error: %s",
+            quote_id,
+            last_exc,
+        )
+
+
+def _patch_quote_financials_after_line_items(
+    sf: Salesforce,
+    quote_id: str,
+    *,
+    amount: float | None,
+) -> None:
+    """
+    Re-apply MRR / ARR / one-time fees on the Quote after QuoteLineItems exist so manual fields
+    stick and rollups that depend on lines have run. Skipped if no financial keys are configured.
+    """
+    patch: dict[str, Any] = {}
+    _merge_quote_financial_header_fields(patch, amount)
+    if not patch:
+        return
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            sf.Quote.update(quote_id, patch)
+            log.info("Patched Quote financial fields on %s: %s", quote_id, sorted(patch.keys()))
+            return
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                break
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                break
+            if code != 400:
+                break
+            drop = _fields_to_drop_from_salesforce_400(exc, patch)
+            if not drop:
+                break
+            removed = False
+            for f in drop:
+                if f in patch:
+                    patch.pop(f)
+                    removed = True
+            if not removed or not patch:
+                break
+            log.warning("Retrying Quote.update (financials) without bad fields: %s", drop)
+    if last_exc:
+        log.warning(
+            "Quote financial patch incomplete for %s (formula fields need Flow or different API names). Last error: %s",
             quote_id,
             last_exc,
         )
@@ -923,6 +1008,7 @@ def _add_quote_line_items(
     extras = _product_line_custom_fields(
         sync_date=sync_date, contract_end=contract_end, term_months=term_months
     )
+    qli_static = _quotelineitem_extra_fields_from_config()
     for _key, _new_qty, delta, ip_id, up in pending:
         if delta <= 0:
             continue
@@ -931,6 +1017,7 @@ def _add_quote_line_items(
             "QuoteId": quote_id,
             "PricebookEntryId": pbe_id,
             "Quantity": qli_qty,
+            **qli_static,
             **extras,
         }
         if up is not None:
@@ -1046,6 +1133,7 @@ def _attach_expansion_quote_and_lines(
         contract_end=contract_end,
         term_months=term_months,
     )
+    _patch_quote_financials_after_line_items(sf, qid, amount=amount)
     _try_set_quote_syncing(sf, qid)
 
 
