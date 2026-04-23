@@ -1281,6 +1281,35 @@ def _merge_quote_header_custom_fields(
     _merge_quote_financial_header_fields(body, amount)
 
 
+def _quote_onetime_fees_api_name() -> str:
+    """
+    Writable Quote field forced to 0 for expansion one-time (not a formula display field).
+    Defaults to One_Time_Fees__c. Set SF_QUOTE_ONETIME_FEES_FIELD to override, or
+    SF_QUOTE_ONETIME_FEES_FIELD_DISABLE=1 to skip all one-time-zero API writes.
+    """
+    if (sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD_DISABLE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return ""
+    raw = (sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD") or "One_Time_Fees__c").strip()
+    if raw and _valid_sf_field_api_name(raw):
+        return raw
+    return ""
+
+
+def _quote_onetime_zero_final_sleep_sec() -> float:
+    """Optional pause before last One_Time_Fees update so async SF logic can finish (0–15s)."""
+    raw = (os.getenv("WEBHOOK_QUOTE_ONETIME_ZERO_SLEEP_SEC") or "0").strip()
+    try:
+        s = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, min(s, 15.0))
+
+
 def _log_quote_financial_fls_hint(exc: BaseException) -> None:
     """If Salesforce returns FLS/read-only errors, tell admins which Quote fields to open up."""
     for err in _salesforce_error_entries(exc):
@@ -1291,7 +1320,7 @@ def _log_quote_financial_fls_hint(exc: BaseException) -> None:
         names = [
             sf_cfg("SF_QUOTE_MRR_FIELD"),
             sf_cfg("SF_QUOTE_ARR_FIELD"),
-            sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD"),
+            _quote_onetime_fees_api_name(),
         ]
         names = [n for n in names if n and _valid_sf_field_api_name(n)]
         if names:
@@ -1316,8 +1345,8 @@ def _merge_quote_financial_header_fields(body: dict[str, Any], amount: float | N
         arr_f = sf_cfg("SF_QUOTE_ARR_FIELD")
         if arr_f and _valid_sf_field_api_name(arr_f):
             body[arr_f] = round(float(amount) * 12.0, 2)
-    otf = sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD")
-    if otf and _valid_sf_field_api_name(otf):
+    otf = _quote_onetime_fees_api_name()
+    if otf:
         body[otf] = 0.0
 
 
@@ -1412,6 +1441,9 @@ def _patch_quote_financials_after_line_items(
     """
     Re-apply MRR / ARR / one-time fees on the Quote after QuoteLineItems exist so manual fields
     stick and rollups that depend on lines have run. Skipped if no financial keys are configured.
+
+    One-time defaults to **One_Time_Fees__c** unless SF_QUOTE_ONETIME_FEES_FIELD overrides or
+    SF_QUOTE_ONETIME_FEES_FIELD_DISABLE=1. Use the writable source field, not a formula display field.
     """
     patch: dict[str, Any] = {}
     _merge_quote_financial_header_fields(patch, amount)
@@ -1449,6 +1481,53 @@ def _patch_quote_financials_after_line_items(
         _log_quote_financial_fls_hint(last_exc)
         log.warning(
             "Quote financial patch incomplete for %s (FLS, formula/rollup read-only, or wrong API names). Last error: %s",
+            quote_id,
+            last_exc,
+        )
+
+
+def _patch_quote_onetime_fees_zero_final(sf: Salesforce, quote_id: str) -> None:
+    """Last-step Quote.update with only the one-time field = 0 (wins over late rollups / flows in many orgs)."""
+    otf = _quote_onetime_fees_api_name()
+    if not otf:
+        return
+    delay = _quote_onetime_zero_final_sleep_sec()
+    if delay > 0:
+        log.info("Sleep %.2fs before final Quote one-time=0 patch (WEBHOOK_QUOTE_ONETIME_ZERO_SLEEP_SEC)", delay)
+        time.sleep(delay)
+    patch: dict[str, Any] = {otf: 0.0}
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            sf.Quote.update(quote_id, patch)
+            log.info("Final Quote patch: %s=0 on %s", otf, quote_id)
+            return
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                break
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                break
+            if code != 400:
+                break
+            drop = _fields_to_drop_from_salesforce_400(exc, patch)
+            if not drop:
+                break
+            removed = False
+            for f in drop:
+                if f in patch:
+                    patch.pop(f)
+                    removed = True
+            if not removed or not patch:
+                break
+            log.warning("Retrying final Quote one-time patch without bad fields: %s", drop)
+    if last_exc:
+        _log_quote_financial_fls_hint(last_exc)
+        log.warning(
+            "Final Quote one-time=0 patch failed for %s (%s). If the field is formula/rollup, API cannot clear it.",
             quote_id,
             last_exc,
         )
@@ -2031,6 +2110,9 @@ def _attach_expansion_quote_and_lines(
         contract_end=contract_end,
         term_months=term_months,
     )
+    # Sync / line rollups can repopulate manual one-time buckets after the first patch; re-apply MRR/ARR/OTF=0.
+    _patch_quote_financials_after_line_items(sf, qid, amount=amount)
+    _patch_quote_onetime_fees_zero_final(sf, qid)
 
 
 def _check_basic_auth() -> bool:
