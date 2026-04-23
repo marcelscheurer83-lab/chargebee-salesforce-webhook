@@ -29,7 +29,12 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 
-from chargebee_client import fetch_self_service_line_quantities, get_client
+from chargebee_client import (
+    _addon_exact_ids_from_env,
+    _crm_addon_line_matches,
+    fetch_self_service_line_quantities,
+    get_client,
+)
 
 _DEFAULT_STATE = Path(__file__).resolve().parent / "webhook_state.json"
 
@@ -37,10 +42,21 @@ _DEFAULT_STATE = Path(__file__).resolve().parent / "webhook_state.json"
 def merge_chargebee_line_quantities_into_dict(lines: dict[str, int]) -> int:
     """
     Pull active subscription self-serve quantities from Chargebee and merge into ``lines`` (in-place).
-    Returns how many subscription lines the API returned.
+    Drops stale ``subscription_id|item_price_id`` keys that match CRM add-on rules but are absent from
+    the API response (add-on removed or subscription inactive). Returns how many lines the API returned.
     """
     client = get_client()
     from_api = fetch_self_service_line_quantities(client)
+    exact = _addon_exact_ids_from_env()
+    stale = [
+        k
+        for k in list(lines.keys())
+        if k not in from_api
+        and "|" in k
+        and _crm_addon_line_matches(k.split("|", 1)[1], None, exact)
+    ]
+    for k in stale:
+        del lines[k]
     lines.update(from_api)
     return len(from_api)
 

@@ -151,7 +151,12 @@ def _sync_self_service_quantities_from_subscription(
     subscription_id: str,
     exact: frozenset[str] | None,
 ) -> None:
-    """Set stored qty for every self-serve line in this subscription payload (Chargebee = source of truth)."""
+    """
+    Set stored qty for every self-serve line on this subscription (Chargebee = source of truth).
+    Removes baseline keys for CRM add-on item_price_ids that no longer appear on the subscription
+    (seats removed / add-on deleted) so the next increase is not compared to a stale high watermark.
+    """
+    present_ip: set[str] = set()
     for si in items:
         if not isinstance(si, dict):
             continue
@@ -163,6 +168,9 @@ def _sync_self_service_quantities_from_subscription(
             exact,
         ):
             continue
+        ip_s = str(ip_id).strip()
+        if ip_s:
+            present_ip.add(ip_s)
         qty_raw = si.get("quantity")
         try:
             new_qty = int(qty_raw) if qty_raw is not None else 0
@@ -170,6 +178,25 @@ def _sync_self_service_quantities_from_subscription(
             new_qty = 0
         key = self_service_line_state_key(subscription_id, str(ip_id))
         lines[key] = new_qty
+
+    prefix = f"{subscription_id}|"
+    stale: list[str] = []
+    for k in list(lines.keys()):
+        if not k.startswith(prefix):
+            continue
+        ip_only = k[len(prefix) :]
+        if not _crm_addon_line_matches(ip_only, None, exact):
+            continue
+        if ip_only not in present_ip:
+            stale.append(k)
+    for k in stale:
+        del lines[k]
+    if stale:
+        log.info(
+            "Pruned webhook baseline (subscription %s) — Chargebee no longer has CRM line(s): %s",
+            subscription_id,
+            stale,
+        )
 
 
 def _load_state() -> dict[str, Any]:
