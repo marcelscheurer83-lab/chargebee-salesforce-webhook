@@ -12,14 +12,20 @@ Chargebee: Settings → Configure Chargebee → Webhooks
   - HTTP Basic Auth: match WEBHOOK_BASIC_USER / WEBHOOK_BASIC_PASS
 
 State file WEBHOOK_STATE_PATH defaults to ./webhook_state.json inside the container; use a volume
-if you need quantities to survive redeploys (otherwise the next event re-baselines without an opp).
+if you need quantities to survive redeploys (otherwise stored_qty resets and the next increase can
+look like a full delta from zero).
 
-By default, after each successfully processed webhook we merge all active self-serve line quantities
-from the Chargebee API into state (same data as seed_webhook_state / POST /admin/seed-state), so
-baselines stay aligned without a manual seed. Disable with WEBHOOK_MERGE_CHARGEBEE_STATE_ON_WEBHOOK=0
-if you prefer fewer API calls. Manual seed is still useful before go-live if state is empty: the
-first increase is computed before this merge, so a cold start can still treat the full current qty
-as delta unless you seeded or use a persistent volume with prior quantities.
+Delta logic: for each self-serve line key ``subscription_id|item_price_id``, ``stored_qty`` is the
+last known quantity in ``line_quantities``. The webhook payload supplies ``chargebee_qty``; a
+positive expansion is queued only when ``chargebee_qty > stored_qty`` (delta = new - old). Decreases
+update the baseline but do not create an Opportunity.
+
+After a successful run (or a no-op event), the handler refreshes baselines from this event's payload
+then optionally merges all active subscription lines from the Chargebee API
+(WEBHOOK_MERGE_CHARGEBEE_STATE_ON_WEBHOOK, same as seed_webhook_state / POST /admin/seed-state).
+
+subscription_created (new subscription) refreshes baseline only by default — it does not create an
+expansion for the initial quantities (set WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED=1 to change).
 
 Products: creates a Quote on the expansion Opportunity, adds QuoteLineItems (seat delta qty), then
 enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId). Expansion can set Amended_Contract__c from
@@ -75,6 +81,35 @@ log.info("Expansion pricing: Quote + QuoteLineItems (standard); quote lines use 
 def _merge_chargebee_state_after_webhook_enabled() -> bool:
     raw = (os.getenv("WEBHOOK_MERGE_CHARGEBEE_STATE_ON_WEBHOOK") or "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+def _allow_expansion_on_subscription_created() -> bool:
+    raw = (os.getenv("WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _apply_baseline_refresh_from_event(
+    items: list[Any],
+    lines: dict[str, int],
+    subscription_id: str,
+    exact: frozenset[str] | None,
+) -> None:
+    """Update ``lines`` from this webhook's payload, then optionally merge all subs from Chargebee API."""
+    _sync_self_service_quantities_from_subscription(items, lines, subscription_id, exact)
+    if not _merge_chargebee_state_after_webhook_enabled():
+        return
+    try:
+        n_cb = merge_chargebee_line_quantities_into_dict(lines)
+        log.info(
+            "Merged %s self-serve subscription lines from Chargebee API into state baseline",
+            n_cb,
+        )
+    except ValueError as e:
+        log.warning("Chargebee baseline merge skipped (check CHARGEBEE_* env): %s", e)
+    except Exception:
+        log.exception(
+            "Chargebee baseline merge failed; continuing with payload-synced quantities only"
+        )
 
 
 def _sync_self_service_quantities_from_subscription(
@@ -1627,8 +1662,23 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             return
 
         lines: dict[str, int] = dict(state.get("line_quantities") or {})
+
+        if event_type == "subscription_created" and not _allow_expansion_on_subscription_created():
+            _apply_baseline_refresh_from_event(items, lines, subscription_id, exact)
+            processed.append(event_id)
+            state["processed_event_ids"] = _trim_processed_ids(processed)
+            state["line_quantities"] = lines
+            _save_state(state)
+            log.info(
+                "subscription_created %s: baseline updated; expansion skipped "
+                "(WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED is off)",
+                subscription_id,
+            )
+            return
+
         pending: list[tuple[str, int, int, str, float | None]] = []
         # pending: (line_key, new_qty, delta, item_price_id, unit_price_major)
+        missing_baseline_warned = False
 
         for si in items:
             if not isinstance(si, dict):
@@ -1649,6 +1699,14 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             key = self_service_line_state_key(subscription_id, str(ip_id))
             stored = lines.get(key)
             old_qty = 0 if stored is None else stored
+            if stored is None and new_qty > 0 and not missing_baseline_warned:
+                missing_baseline_warned = True
+                log.warning(
+                    "No stored baseline for self-serve line %s; treating prior qty as 0 for this delta. "
+                    "If you just redeployed, seed WEBHOOK_STATE_PATH (POST /admin/seed-state or "
+                    "seed_webhook_state.py) so the next increase is only the real delta.",
+                    key,
+                )
             if new_qty <= old_qty:
                 continue
 
@@ -1746,22 +1804,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 mark_processed = False
 
         if mark_processed:
-            _sync_self_service_quantities_from_subscription(
-                items, lines, subscription_id, exact
-            )
-            if _merge_chargebee_state_after_webhook_enabled():
-                try:
-                    n_cb = merge_chargebee_line_quantities_into_dict(lines)
-                    log.info(
-                        "Merged %s self-serve subscription lines from Chargebee API into state",
-                        n_cb,
-                    )
-                except ValueError as e:
-                    log.warning("Chargebee state merge skipped (check CHARGEBEE_* env): %s", e)
-                except Exception:
-                    log.exception(
-                        "Chargebee state merge failed; continuing with payload-synced quantities only"
-                    )
+            _apply_baseline_refresh_from_event(items, lines, subscription_id, exact)
             processed.append(event_id)
         state["processed_event_ids"] = _trim_processed_ids(processed)
         state["line_quantities"] = lines
