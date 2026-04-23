@@ -2202,6 +2202,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             pending: list[tuple[str, int, int, str, float | None]] = []
             # pending: (line_key, new_qty, delta, item_price_id, unit_price_major)
             missing_baseline_warned = False
+            first_tracked_line: tuple[str, str, int | None, int, int] | None = None
 
             for si in items:
                 if not isinstance(si, dict):
@@ -2249,6 +2250,8 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     )
                 else:
                     old_qty = 0
+                if first_tracked_line is None:
+                    first_tracked_line = (key, str(ip_id), stored, old_qty, new_qty)
                 if stored is None and inferred is None and new_qty > 0 and not missing_baseline_warned:
                     missing_baseline_warned = True
                     log.warning(
@@ -2286,10 +2289,24 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 log.info(
                     "No expansion Opportunity: no positive seat delta for tracked self-serve lines "
                     "(event_id=%s subscription_id=%s). Usually state already matches Chargebee qty "
-                    "(recent merge or prior webhook); increase seats again or re-send webhook after a real change.",
+                    "(subscription_created baseline, POST /admin/seed-state, or merge after a prior webhook). "
+                    "New subs: set WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED=1 if the first seat qty "
+                    "should create an expansion.",
                     event_id,
                     subscription_id,
                 )
+                if first_tracked_line:
+                    fk, fip, fst, fold, fnew = first_tracked_line
+                    log.info(
+                        "No-expansion detail (first CRM line in payload): key=%s item_price_id=%s "
+                        "stored_in_state=%s effective_prior_qty=%s chargebee_qty=%s "
+                        "(delta needs chargebee_qty > effective_prior; subscription_created may have set state first).",
+                        fk,
+                        fip,
+                        fst,
+                        fold,
+                        fnew,
+                    )
             if pending:
                 sf = _get_salesforce()
                 account_id = _resolve_account_id(sf, customer, customer_id)
