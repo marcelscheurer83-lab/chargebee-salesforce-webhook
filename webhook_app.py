@@ -1464,6 +1464,38 @@ def _add_quote_line_items(
             log.exception("QuoteLineItem create failed item_price_id=%s", ip_id)
 
 
+def _log_pricebook_entry_product_for_quote(sf: Salesforce, pbe_id: str) -> None:
+    """
+    Log Product2 behind the PricebookEntry. Quote MRR/ARR vs one-time rollups usually key off
+    Product Family or custom Product / QLI fields; API-created lines skip the 'Add Products' wizard
+    that sets those defaults unless you map them (SF_QUOTELINEITEM_STATIC_FIELDS_JSON).
+    """
+    pid = _canonical_salesforce_id(pbe_id)
+    try:
+        res = sf.query(
+            "SELECT Product2Id, Product2.Name, Product2.Family FROM PricebookEntry WHERE Id = "
+            f"'{_soql_escape(pid)}' LIMIT 1"
+        )
+    except Exception:
+        log.exception("PricebookEntry product context query failed pbe=%s", pid)
+        return
+    recs = res.get("records") or []
+    if not recs:
+        log.warning("PricebookEntry %s not found for product context log", pid)
+        return
+    r0 = recs[0]
+    p2 = r0.get("Product2") or {}
+    log.info(
+        "Quote will use PricebookEntry %s → Product2 %s Name=%r Family=%r "
+        "(if rollups put line total in One-Time but MRR is $0, fix Product2 classification or set "
+        "SF_QUOTELINEITEM_STATIC_FIELDS_JSON to match a manual recurring line)",
+        pid,
+        r0.get("Product2Id"),
+        p2.get("Name"),
+        p2.get("Family"),
+    )
+
+
 def _attach_expansion_quote_and_lines(
     sf: Salesforce,
     opp_id: str,
@@ -1486,6 +1518,7 @@ def _attach_expansion_quote_and_lines(
         )
         return
     pbe_id, pb2_id = resolved
+    _log_pricebook_entry_product_for_quote(sf, pbe_id)
     if not _ensure_opportunity_pricebook(sf, opp_id, pb2_id):
         log.error("Cannot create Quote: failed to set Opportunity Pricebook2Id=%s opp=%s", pb2_id, opp_id)
         return
