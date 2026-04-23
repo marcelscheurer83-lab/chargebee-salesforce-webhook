@@ -360,7 +360,12 @@ def _expansion_term_months(sync_date: date, contract_end: date | None) -> float 
 
 
 def _line_item_end_date_from_contract(contract_end: date) -> date:
-    """Apply SF_OLI_END_DATE_OFFSET_DAYS (e.g. -1 when line End Date is day before Contract End)."""
+    """
+    Optional calendar offset for quote line End Date fields vs canonical contract end.
+
+    Use 0 so Opportunity, Quote header, and Quote line ends all match the Closed Won NB/Renewal
+    contract end. A non-zero offset (e.g. -1) makes lines one day earlier than the header.
+    """
     try:
         off = int((sf_cfg("SF_OLI_END_DATE_OFFSET_DAYS") or "0").strip() or "0")
     except ValueError:
@@ -422,7 +427,7 @@ def _query_expansion_contract_end_from_won_opportunities(sf: Salesforce, account
     safe_acc = _soql_escape(account_id)
     in_list = ",".join(f"'{_soql_escape(n)}'" for n in names)
     q = (
-        f"SELECT {end_f}, Contract.EndDate FROM Opportunity WHERE AccountId = '{safe_acc}' "
+        f"SELECT Id, CloseDate, {end_f}, Contract.EndDate FROM Opportunity WHERE AccountId = '{safe_acc}' "
         f"AND IsClosed = true AND IsWon = true "
         f"AND RecordType.DeveloperName IN ({in_list}) "
         f"ORDER BY CloseDate DESC LIMIT 1"
@@ -440,22 +445,44 @@ def _query_expansion_contract_end_from_won_opportunities(sf: Salesforce, account
             account_id,
         )
         return None
-    raw = _parse_sf_date(recs[0].get(end_f))
+    row = recs[0]
+    opp_won_id = str(row.get("Id") or "")
+    from_field = _parse_sf_date(row.get(end_f))
+    con = row.get("Contract")
+    from_contract = _parse_sf_date(con.get("EndDate")) if isinstance(con, dict) else None
+    if (
+        from_field is not None
+        and from_contract is not None
+        and from_field != from_contract
+    ):
+        log.warning(
+            "Won Opp %s: %s=%s differs from Contract.EndDate=%s; using %s for expansion (aligns with NB/Renewal opp).",
+            opp_won_id,
+            end_f,
+            from_field.isoformat(),
+            from_contract.isoformat(),
+            end_f,
+        )
+    raw = from_field
+    source = end_f
     if raw is None:
-        con = recs[0].get("Contract")
-        if isinstance(con, dict):
-            raw = _parse_sf_date(con.get("EndDate"))
+        raw = from_contract
+        source = "Contract.EndDate"
     if raw is None:
         log.warning(
-            "Latest Won %s Opportunity for Account %s has no %s or Contract.EndDate",
+            "Latest Won %s Opportunity %s for Account %s has no %s or Contract.EndDate",
             names,
+            opp_won_id or "?",
             account_id,
             end_f,
         )
         return None
     log.info(
-        "Expansion contract end %s from latest Closed Won NB/Renewal (Account %s)",
+        "Expansion contract end %s from Won NB/Renewal Opp %s (CloseDate=%s, source=%s; Account %s)",
         raw.isoformat(),
+        opp_won_id,
+        row.get("CloseDate"),
+        source,
         account_id,
     )
     return raw

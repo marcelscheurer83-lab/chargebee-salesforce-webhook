@@ -26,7 +26,7 @@
   "SF_OLI_END_DATE_FIELD": "End_Date__c",
   "SF_OLI_TERM_MONTHS_FIELD": "Term_Months__c",
   "SF_USE_PRORATED_TERM_MONTHS": "true",
-  "SF_OLI_END_DATE_OFFSET_DAYS": "-1",
+  "SF_OLI_END_DATE_OFFSET_DAYS": "0",
   "SF_QTI_SET_STANDARD_SERVICE_DATE": "true",
   "SF_QUOTELINEITEM_STATIC_FIELDS_JSON": "{\"isARR__c\":true}",
   "SF_QTI_DESCRIPTION_TEMPLATE": "{product_name} — +{delta} CRM self-serve seats ({item_price_id})",
