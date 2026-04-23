@@ -1755,28 +1755,29 @@ def _patch_quotelineitem_start_and_term(
 
 
 def _log_quotelineitem_end_dates_after_finalize(sf: Salesforce, quote_id: str) -> None:
+    """Debug SOQL for line end after sync; many orgs have no standard QuoteLineItem.EndDate (only custom/formula)."""
     qid = _canonical_salesforce_id(quote_id)
     end_f = sf_cfg("SF_OLI_END_DATE_FIELD")
-    fields = "Id, EndDate"
-    if end_f and _valid_sf_field_api_name(end_f):
-        fields += f", {end_f}"
+    if not end_f or not _valid_sf_field_api_name(end_f):
+        return
+    fields = f"Id, {end_f}"
     try:
         res = sf.query(
             f"SELECT {fields} FROM QuoteLineItem WHERE QuoteId = '{_soql_escape(qid)}' LIMIT 80"
         )
-    except Exception:
-        log.exception("QuoteLineItem post-finalize date readback failed quote=%s", qid)
+    except Exception as exc:
+        log.warning(
+            "QuoteLineItem post-finalize date readback skipped quote=%s (%s)",
+            qid,
+            exc,
+        )
         return
     parts: list[str] = []
     for r in res.get("records") or []:
         rid = r.get("Id")
-        ed = r.get("EndDate")
-        if end_f:
-            parts.append(f"{rid}:EndDate={ed},{end_f}={r.get(end_f)}")
-        else:
-            parts.append(f"{rid}:EndDate={ed}")
+        parts.append(f"{rid}:{end_f}={r.get(end_f)}")
     if parts:
-        log.info("QuoteLineItem dates after sync+finalize on quote %s: %s", qid, "; ".join(parts))
+        log.info("QuoteLineItem %s after sync+finalize on quote %s: %s", end_f, qid, "; ".join(parts))
 
 
 def _finalize_expansion_quotelineitem_contract_dates(
