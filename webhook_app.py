@@ -684,6 +684,28 @@ def _merge_quote_header_custom_fields(
     _merge_quote_financial_header_fields(body, amount)
 
 
+def _log_quote_financial_fls_hint(exc: BaseException) -> None:
+    """If Salesforce returns FLS/read-only errors, tell admins which Quote fields to open up."""
+    for err in _salesforce_error_entries(exc):
+        code = err.get("errorCode") or ""
+        msg = str(err.get("message") or "").lower()
+        if code != "INVALID_FIELD_FOR_INSERT_UPDATE" and "security settings" not in msg:
+            continue
+        names = [
+            sf_cfg("SF_QUOTE_MRR_FIELD"),
+            sf_cfg("SF_QUOTE_ARR_FIELD"),
+            sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD"),
+        ]
+        names = [n for n in names if n and _valid_sf_field_api_name(n)]
+        if names:
+            log.warning(
+                "Grant the Salesforce integration user Edit (field-level security) on Quote for: %s. "
+                "Setup → Permission Sets (or Profile) → Object Settings → Quote → Field Permissions.",
+                ", ".join(names),
+            )
+        return
+
+
 def _merge_quote_financial_header_fields(body: dict[str, Any], amount: float | None) -> None:
     """
     Quote header: MRR/ARR from delta seat revenue (Chargebee unit price × delta qty).
@@ -826,8 +848,9 @@ def _patch_quote_financials_after_line_items(
                 break
             log.warning("Retrying Quote.update (financials) without bad fields: %s", drop)
     if last_exc:
+        _log_quote_financial_fls_hint(last_exc)
         log.warning(
-            "Quote financial patch incomplete for %s (formula fields need Flow or different API names). Last error: %s",
+            "Quote financial patch incomplete for %s (FLS, formula/rollup read-only, or wrong API names). Last error: %s",
             quote_id,
             last_exc,
         )
