@@ -33,6 +33,9 @@ the latest Closed Won NB/Renewal Opportunity’s ContractId (SF_OPP_AMENDED_CONT
 SF_OPP_POPULATE_CONTRACT_LOOKUP + SOQL sets Opportunity ContractId. After each successful webhook,
 line quantities are synced from the payload, then optionally merged from Chargebee. Prorated Term (Months)
 (SF_USE_PRORATED_TERM_MONTHS) and ServiceDate on lines help match co-termed expansion subscription quotes.
+
+Expansion Opportunity contract end date prefers the same field on the latest Closed Won New Business/Renewal
+as amended Contract (fallback: open Renewal). Optional Chatter post (SF_CHATTER_EXPANSION_*) notifies a user.
 """
 
 from __future__ import annotations
@@ -380,6 +383,84 @@ def _opportunity_mrr_field_updates(amount: float | None) -> dict[str, float]:
     return patch
 
 
+def _closed_won_nb_renewal_record_type_developer_names() -> list[str] | None:
+    """RecordType DeveloperNames for New Business + Renewal (same scope as amended Contract lookup)."""
+    rts = (sf_cfg("SF_AMENDED_CONTRACT_SOURCE_RECORD_TYPE_DEVELOPER_NAMES") or "").strip()
+    if rts:
+        names = [n.strip() for n in rts.split(",") if n.strip()]
+    else:
+        names = []
+        nb = (sf_cfg("SF_NEW_BUSINESS_RECORD_TYPE_DEVELOPER_NAME") or "").strip()
+        ren = (sf_cfg("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME") or "Renewal").strip()
+        if nb and _valid_sf_field_api_name(nb):
+            names.append(nb)
+        if ren and _valid_sf_field_api_name(ren):
+            names.append(ren)
+    if not names:
+        return None
+    for n in names:
+        if not _valid_sf_field_api_name(n):
+            return None
+    return names
+
+
+def _query_expansion_contract_end_from_won_opportunities(sf: Salesforce, account_id: str) -> date | None:
+    """
+    Expansion Opportunity contract end: use SF_OPP_CONTRACT_END_DATE_FIELD (or Contract.EndDate) from the
+    latest Closed Won New Business / Renewal on the Account — same record-type set as amended Contract.
+    """
+    end_f = sf_cfg("SF_OPP_CONTRACT_END_DATE_FIELD")
+    if not end_f or not _valid_sf_field_api_name(end_f):
+        return None
+    names = _closed_won_nb_renewal_record_type_developer_names()
+    if not names:
+        log.warning(
+            "Contract end from Won opp: configure SF_AMENDED_CONTRACT_SOURCE_RECORD_TYPE_DEVELOPER_NAMES "
+            "or SF_NEW_BUSINESS_RECORD_TYPE_DEVELOPER_NAME + SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME"
+        )
+        return None
+    safe_acc = _soql_escape(account_id)
+    in_list = ",".join(f"'{_soql_escape(n)}'" for n in names)
+    q = (
+        f"SELECT {end_f}, Contract.EndDate FROM Opportunity WHERE AccountId = '{safe_acc}' "
+        f"AND IsClosed = true AND IsWon = true "
+        f"AND RecordType.DeveloperName IN ({in_list}) "
+        f"ORDER BY CloseDate DESC LIMIT 1"
+    )
+    try:
+        res = sf.query(q)
+    except Exception:
+        log.exception("Contract end (Won NB/Renewal) SOQL failed")
+        return None
+    recs = res.get("records") or []
+    if not recs:
+        log.warning(
+            "No Closed Won %s Opportunity for contract end date (Account %s)",
+            names,
+            account_id,
+        )
+        return None
+    raw = _parse_sf_date(recs[0].get(end_f))
+    if raw is None:
+        con = recs[0].get("Contract")
+        if isinstance(con, dict):
+            raw = _parse_sf_date(con.get("EndDate"))
+    if raw is None:
+        log.warning(
+            "Latest Won %s Opportunity for Account %s has no %s or Contract.EndDate",
+            names,
+            account_id,
+            end_f,
+        )
+        return None
+    log.info(
+        "Expansion contract end %s from latest Closed Won NB/Renewal (Account %s)",
+        raw.isoformat(),
+        account_id,
+    )
+    return raw
+
+
 def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) -> date | None:
     """
     Value for the expansion Opportunity's contract end date field.
@@ -524,17 +605,7 @@ def _query_amended_contract_from_won_opportunities(sf: Salesforce, account_id: s
     if not acf or not _valid_sf_field_api_name(acf):
         return None
 
-    rts = (sf_cfg("SF_AMENDED_CONTRACT_SOURCE_RECORD_TYPE_DEVELOPER_NAMES") or "").strip()
-    if rts:
-        names = [n.strip() for n in rts.split(",") if n.strip()]
-    else:
-        names = []
-        nb = (sf_cfg("SF_NEW_BUSINESS_RECORD_TYPE_DEVELOPER_NAME") or "").strip()
-        ren = (sf_cfg("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME") or "Renewal").strip()
-        if nb and _valid_sf_field_api_name(nb):
-            names.append(nb)
-        if ren and _valid_sf_field_api_name(ren):
-            names.append(ren)
+    names = _closed_won_nb_renewal_record_type_developer_names()
     if not names:
         log.warning(
             "Amended_Contract: set SF_AMENDED_CONTRACT_SOURCE_RECORD_TYPE_DEVELOPER_NAMES "
@@ -542,10 +613,6 @@ def _query_amended_contract_from_won_opportunities(sf: Salesforce, account_id: s
             "+ SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME"
         )
         return None
-    for n in names:
-        if not _valid_sf_field_api_name(n):
-            log.warning("Invalid RecordType DeveloperName for amended-contract query: %s", n)
-            return None
 
     safe_acc = _soql_escape(account_id)
     in_list = ",".join(f"'{_soql_escape(n)}'" for n in names)
@@ -577,6 +644,33 @@ def _query_amended_contract_from_won_opportunities(sf: Salesforce, account_id: s
         account_id,
     )
     return cid
+
+
+def _post_expansion_opportunity_chatter(sf: Salesforce, opportunity_id: str) -> None:
+    """Optional Chatter post on the new expansion Opportunity (mention + message via Chatter REST)."""
+    if (sf_cfg("SF_CHATTER_EXPANSION_POST") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    uid_raw = (sf_cfg("SF_CHATTER_EXPANSION_NOTIFY_USER_ID") or "").strip()
+    msg = (sf_cfg("SF_CHATTER_EXPANSION_MESSAGE") or "New self-service expansion opportunity created.").strip()
+    if not msg:
+        return
+    segments: list[dict[str, Any]] = []
+    if uid_raw:
+        uid = _canonical_salesforce_id(uid_raw)
+        if len(uid) >= 15:
+            segments.append({"type": "Mention", "id": uid})
+            segments.append({"type": "Text", "text": ": "})
+    segments.append({"type": "Text", "text": msg})
+    payload: dict[str, Any] = {
+        "body": {"messageSegments": segments},
+        "feedElementType": "FeedItem",
+        "subjectId": opportunity_id,
+    }
+    try:
+        sf.restful("chatter/feed-elements", method="POST", json=payload)
+        log.info("Posted Chatter on Opportunity %s", opportunity_id)
+    except Exception:
+        log.exception("Chatter feed post failed for Opportunity %s", opportunity_id)
 
 
 def _get_salesforce() -> Salesforce:
@@ -1768,7 +1862,9 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     if any_price:
                         amount = amt_sum
                     desc = "\n".join(parts)
-                    contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
+                    contract_end = _query_expansion_contract_end_from_won_opportunities(sf, account_id)
+                    if contract_end is None:
+                        contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
                     term_months = _expansion_term_months(sync_date, contract_end)
                     oid = _create_expansion_opportunity(
                         sf,
@@ -1799,6 +1895,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                         amount=amount,
                     )
                     _update_opportunity_mrr_after_products(sf, oid, amount)
+                    _post_expansion_opportunity_chatter(sf, oid)
             else:
                 log.warning("Skipping Opportunity: no Salesforce Account for customer_id=%s", customer_id)
                 mark_processed = False
