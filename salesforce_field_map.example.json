@@ -35,7 +35,7 @@
   "SF_QTI_SET_STANDARD_SERVICE_DATE": "true",
   "SF_QUOTELINEITEM_STATIC_FIELDS_JSON": "{\"isARR__c\":true,\"Recurring__c\":true}",
   "SF_QTI_DESCRIPTION_TEMPLATE": "{product_name} — +{delta} CRM self-serve seats ({item_price_id})",
-  "SF_CHATTER_EXPANSION_NOTIFY_USER_ID": "005fi000000cxtWAAQ",
+  "SF_CHATTER_EXPANSION_NOTIFY_USER_ID": "005fi000000cxtWAAQ,005Vq00000B3jbmIAB",
   "SF_CHATTER_EXPANSION_MESSAGE": "New self-service expansion opportunity created.",
   "SF_EVENT_TIMEZONE": "America/New_York"
 }

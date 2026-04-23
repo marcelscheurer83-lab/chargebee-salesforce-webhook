@@ -857,7 +857,7 @@ def _query_amended_contract_from_won_opportunities(sf: Salesforce, account_id: s
 
 
 def _post_expansion_opportunity_chatter(sf: Salesforce, opportunity_id: str) -> None:
-    """Optional Chatter post on the new expansion Opportunity (mention + message via Chatter REST)."""
+    """Optional Chatter post on the new expansion Opportunity (mentions + message via Chatter REST)."""
     if (sf_cfg("SF_CHATTER_EXPANSION_POST") or "1").strip().lower() in ("0", "false", "no", "off"):
         return
     uid_raw = (sf_cfg("SF_CHATTER_EXPANSION_NOTIFY_USER_ID") or "").strip()
@@ -865,11 +865,22 @@ def _post_expansion_opportunity_chatter(sf: Salesforce, opportunity_id: str) -> 
     if not msg:
         return
     segments: list[dict[str, Any]] = []
-    if uid_raw:
-        uid = _canonical_salesforce_id(uid_raw)
-        if len(uid) >= 15:
-            segments.append({"type": "Mention", "id": uid})
-            segments.append({"type": "Text", "text": ": "})
+    mention_ids: list[str] = []
+    seen: set[str] = set()
+    for part in uid_raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        uid = _canonical_salesforce_id(p)
+        if len(uid) >= 15 and uid not in seen:
+            seen.add(uid)
+            mention_ids.append(uid)
+    for i, uid in enumerate(mention_ids):
+        if i:
+            segments.append({"type": "Text", "text": " "})
+        segments.append({"type": "Mention", "id": uid})
+    if mention_ids:
+        segments.append({"type": "Text", "text": ": "})
     segments.append({"type": "Text", "text": msg})
     payload: dict[str, Any] = {
         "body": {"messageSegments": segments},
