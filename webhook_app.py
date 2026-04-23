@@ -22,8 +22,8 @@ first increase is computed before this merge, so a cold start can still treat th
 as delta unless you seeded or use a persistent volume with prior quantities.
 
 Products: creates a Quote on the expansion Opportunity, adds QuoteLineItems (seat delta qty), then
-enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId) so products roll up on the Opp. Optional
-SF_QUOTE_* revenue fields and SF_QUOTELINEITEM_STATIC_FIELDS_JSON are in .env.example. After each
+enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId). Optional SF_OPP_CONTRACT_LOOKUP_* links the
+Opp to a Contract on the Account (SOQL or CHARGEBEE_SUBSCRIPTION_SF_CONTRACT_FIELD). After each
 successful webhook, line quantities are synced from the payload, then optionally merged from Chargebee.
 """
 
@@ -325,6 +325,99 @@ def _query_expansion_contract_end_from_renewal(sf: Salesforce, account_id: str) 
     return raw
 
 
+def _truthy_cfg(key: str) -> bool:
+    return (sf_cfg(key) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_sf_contract_id_for_account(
+    sf: Salesforce,
+    account_id: str,
+    sync_date: date,
+    subscription: dict[str, Any] | None,
+) -> str | None:
+    """
+    Salesforce Contract Id to store on the expansion Opportunity (lookup API name in SF_OPP_CONTRACT_LOOKUP_FIELD).
+
+    Resolution order:
+      1) Chargebee subscription custom field CHARGEBEE_SUBSCRIPTION_SF_CONTRACT_FIELD (18-char SF Id), if set.
+      2) SOQL on standard Contract: AccountId + optional Status filter + optional date overlap with sync_date.
+
+    Configure SF_CONTRACT_STATUS_FILTER (comma-separated, e.g. Activated) and SF_CONTRACT_DATE_OVERLAP_EVENT.
+    """
+    cb_field = (sf_cfg("CHARGEBEE_SUBSCRIPTION_SF_CONTRACT_FIELD") or "").strip()
+    if cb_field and subscription:
+        raw = subscription.get(cb_field)
+        if raw is not None and str(raw).strip():
+            cid = str(raw).strip()
+            log.info("Contract Id from Chargebee field %s=%s", cb_field, cid)
+            return cid
+
+    opp_lookup = sf_cfg("SF_OPP_CONTRACT_LOOKUP_FIELD")
+    if not opp_lookup or not _valid_sf_field_api_name(opp_lookup):
+        return None
+
+    obj = (sf_cfg("SF_CONTRACT_OBJECT_API_NAME") or "Contract").strip()
+    if obj not in ("Contract", "ServiceContract"):
+        log.warning("SF_CONTRACT_OBJECT_API_NAME must be Contract or ServiceContract; got %r", obj)
+        obj = "Contract"
+
+    safe_acc = _soql_escape(account_id)
+    conditions: list[str] = [f"AccountId = '{safe_acc}'"]
+
+    status_raw = (sf_cfg("SF_CONTRACT_STATUS_FILTER") or "").strip()
+    if status_raw:
+        parts = [p.strip() for p in status_raw.split(",") if p.strip()]
+        if len(parts) == 1:
+            conditions.append(f"Status = '{_soql_escape(parts[0])}'")
+        elif len(parts) > 1:
+            in_list = ",".join(f"'{_soql_escape(p)}'" for p in parts)
+            conditions.append(f"Status IN ({in_list})")
+
+    if (sf_cfg("SF_CONTRACT_DATE_OVERLAP_EVENT", "1") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        d = sync_date.isoformat()
+        conditions.append(f"StartDate <= {d}")
+        conditions.append(f"(EndDate = NULL OR EndDate >= {d})")
+
+    order = (sf_cfg("SF_CONTRACT_SOQL_ORDER_BY") or "StartDate DESC").strip()
+    allowed_order = frozenset(
+        {
+            "StartDate DESC",
+            "StartDate ASC",
+            "EndDate DESC",
+            "EndDate ASC",
+            "CreatedDate DESC",
+        }
+    )
+    if order not in allowed_order:
+        order = "StartDate DESC"
+
+    q = f"SELECT Id FROM {obj} WHERE {' AND '.join(conditions)} ORDER BY {order} LIMIT 1"
+    try:
+        res = sf.query(q)
+    except Exception:
+        log.exception("Contract lookup SOQL failed: %s", q[:500])
+        return None
+    recs = res.get("records") or []
+    if not recs:
+        log.warning(
+            "No %s matched Account %s (Status filter=%r overlap=%s).",
+            obj,
+            account_id,
+            status_raw or None,
+            (sf_cfg("SF_CONTRACT_DATE_OVERLAP_EVENT", "1") or "1").strip().lower()
+            not in ("0", "false", "no", "off"),
+        )
+        return None
+    cid = str(recs[0]["Id"])
+    log.info("Resolved %s %s for expansion Opportunity (Account %s)", obj, cid, account_id)
+    return cid
+
+
 def _get_salesforce() -> Salesforce:
     username = sf_cfg("SF_USERNAME")
     password = sf_cfg("SF_PASSWORD")
@@ -404,6 +497,7 @@ def _create_expansion_opportunity(
     sync_date: date,
     contract_end: date | None,
     term_months: int | None,
+    contract_id: str | None = None,
 ) -> str:
     stage = sf_cfg("SF_OPPORTUNITY_STAGE", "Prospecting")
     use_event_close = (sf_cfg("SF_OPPORTUNITY_CLOSE_DATE_USE_EVENT", "1") or "1").strip().lower() not in (
@@ -444,6 +538,10 @@ def _create_expansion_opportunity(
     # MRR is set after QuoteLineItem rows (many orgs use formulas tied to products).
     if (sf_cfg("SF_OPP_MRR_SET_ON_CREATE") or "").strip().lower() in ("1", "true", "yes"):
         body.update(_opportunity_mrr_field_updates(amount))
+
+    clf = sf_cfg("SF_OPP_CONTRACT_LOOKUP_FIELD")
+    if contract_id and clf and _valid_sf_field_api_name(clf):
+        body[clf] = contract_id
 
     last_exc: BaseException | None = None
     for _attempt in range(8):
@@ -1344,56 +1442,66 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             sf = _get_salesforce()
             account_id = _resolve_account_id(sf, customer, customer_id)
             if account_id:
-                total_delta = sum(p[2] for p in pending)
-                amount: float | None = None
-                parts: list[str] = [
-                    f"Chargebee self-serve CRM seat increases (total +{total_delta} seats).",
-                    f"customer_id={customer_id}",
-                    f"subscription_id={subscription_id}",
-                    f"chargebee_event_id={event_id}",
-                    "",
-                ]
-                amt_sum = 0.0
-                any_price = False
-                for key, _new_qty, delta, ip_id, up in pending:
-                    parts.append(f"item_price_id={ip_id}  +{delta} seats")
-                    if up is not None:
-                        any_price = True
-                        amt_sum += up * delta
-                if any_price:
-                    amount = amt_sum
-                desc = "\n".join(parts)
-                contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
-                term_months: int | None = None
-                if contract_end is not None:
-                    term_months = _months_between_start_and_end(sync_date, contract_end)
-                oid = _create_expansion_opportunity(
-                    sf,
-                    company=company,
-                    account_id=account_id,
-                    customer_id=customer_id,
-                    subscription_id=subscription_id,
-                    event_id=event_id,
-                    total_seat_delta=total_delta,
-                    description=desc,
-                    amount=amount,
-                    sync_date=sync_date,
-                    contract_end=contract_end,
-                    term_months=term_months,
-                )
-                log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
-                _attach_expansion_quote_and_lines(
-                    sf,
-                    oid,
-                    company=company or customer_id,
-                    total_seat_delta=total_delta,
-                    pending=pending,
-                    sync_date=sync_date,
-                    contract_end=contract_end,
-                    term_months=term_months,
-                    amount=amount,
-                )
-                _update_opportunity_mrr_after_products(sf, oid, amount)
+                contract_id = _resolve_sf_contract_id_for_account(sf, account_id, sync_date, sub)
+                if _truthy_cfg("SF_OPP_CONTRACT_LOOKUP_REQUIRED") and not contract_id:
+                    log.error(
+                        "Skipping expansion Opportunity: SF_OPP_CONTRACT_LOOKUP_REQUIRED but no Contract "
+                        "resolved for Account %s (map SF_OPP_CONTRACT_LOOKUP_FIELD and check Contract SOQL filters).",
+                        account_id,
+                    )
+                    mark_processed = False
+                else:
+                    total_delta = sum(p[2] for p in pending)
+                    amount: float | None = None
+                    parts: list[str] = [
+                        f"Chargebee self-serve CRM seat increases (total +{total_delta} seats).",
+                        f"customer_id={customer_id}",
+                        f"subscription_id={subscription_id}",
+                        f"chargebee_event_id={event_id}",
+                        "",
+                    ]
+                    amt_sum = 0.0
+                    any_price = False
+                    for key, _new_qty, delta, ip_id, up in pending:
+                        parts.append(f"item_price_id={ip_id}  +{delta} seats")
+                        if up is not None:
+                            any_price = True
+                            amt_sum += up * delta
+                    if any_price:
+                        amount = amt_sum
+                    desc = "\n".join(parts)
+                    contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
+                    term_months: int | None = None
+                    if contract_end is not None:
+                        term_months = _months_between_start_and_end(sync_date, contract_end)
+                    oid = _create_expansion_opportunity(
+                        sf,
+                        company=company,
+                        account_id=account_id,
+                        customer_id=customer_id,
+                        subscription_id=subscription_id,
+                        event_id=event_id,
+                        total_seat_delta=total_delta,
+                        description=desc,
+                        amount=amount,
+                        sync_date=sync_date,
+                        contract_end=contract_end,
+                        term_months=term_months,
+                        contract_id=contract_id,
+                    )
+                    log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
+                    _attach_expansion_quote_and_lines(
+                        sf,
+                        oid,
+                        company=company or customer_id,
+                        total_seat_delta=total_delta,
+                        pending=pending,
+                        sync_date=sync_date,
+                        contract_end=contract_end,
+                        term_months=term_months,
+                        amount=amount,
+                    )
+                    _update_opportunity_mrr_after_products(sf, oid, amount)
             else:
                 log.warning("Skipping Opportunity: no Salesforce Account for customer_id=%s", customer_id)
                 mark_processed = False
