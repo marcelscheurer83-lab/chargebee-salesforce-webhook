@@ -1283,9 +1283,9 @@ def _merge_quote_header_custom_fields(
 
 def _quote_onetime_fees_api_name() -> str:
     """
-    Writable Quote field forced to 0 for expansion one-time (not a formula display field).
-    Defaults to One_Time_Fees__c. Set SF_QUOTE_ONETIME_FEES_FIELD to override, or
-    SF_QUOTE_ONETIME_FEES_FIELD_DISABLE=1 to skip all one-time-zero API writes.
+    Writable Quote currency only. If One_Time_Fees__c is a roll-up summary, API writes fail — use
+    SF_QUOTE_ONETIME_FEES_FIELD_DISABLE=1 and set QuoteLineItem fields (e.g. Recurring) so lines are
+    excluded from the rollup filter. Defaults to One_Time_Fees__c when not disabled.
     """
     if (sf_cfg("SF_QUOTE_ONETIME_FEES_FIELD_DISABLE") or "").strip().lower() in (
         "1",
