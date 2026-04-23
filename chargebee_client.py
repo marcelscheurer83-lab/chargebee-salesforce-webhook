@@ -44,6 +44,26 @@ def _addon_exact_ids_from_env() -> frozenset[str] | None:
         return None
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
+
+def subscription_items_from_webhook_subscription(sub: dict[str, Any]) -> list[Any]:
+    """
+    Line items under ``content.subscription`` in Chargebee webhooks. Keys vary by product catalog /
+    API version: ``subscription_items`` (common), ``subscription_items_list``, or ``items`` (PC 2.0).
+    Prefer the first **non-empty** list so we do not miss lines when one key is [] and another is populated.
+    """
+    if not isinstance(sub, dict):
+        return []
+    keys = ("subscription_items", "subscription_items_list", "items")
+    fallback: list[Any] = []
+    for key in keys:
+        v = sub.get(key)
+        if not isinstance(v, list):
+            continue
+        if len(v) > 0:
+            return v
+        fallback = v
+    return fallback
+
 # Chargebee stores integer amounts in smallest currency unit except these (whole major units).
 _ZERO_DECIMAL_CURRENCIES = frozenset(
     {

@@ -63,10 +63,12 @@ from flask import Flask, jsonify, request
 from simple_salesforce import Salesforce
 
 from chargebee_client import (
+    ADDON_ITEM_PRICE_ID_PREFIXES,
     _addon_exact_ids_from_env,
     _crm_addon_line_matches,
     infer_prior_self_serve_qty_from_subscription_changed_events,
     self_service_line_state_key,
+    subscription_items_from_webhook_subscription,
 )
 from seed_webhook_state import (
     merge_chargebee_into_state_file,
@@ -2175,9 +2177,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
     )
 
     exact = _addon_exact_ids_from_env()
-    items = sub.get("subscription_items") or sub.get("subscription_items_list") or []
-    if not isinstance(items, list):
-        items = []
+    items = subscription_items_from_webhook_subscription(sub if isinstance(sub, dict) else {})
 
     with _state_lock:
         state = _load_state()
@@ -2306,6 +2306,29 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                         fst,
                         fold,
                         fnew,
+                    )
+                else:
+                    brief: list[str] = []
+                    for si in items:
+                        if not isinstance(si, dict):
+                            continue
+                        brief.append(
+                            "type=%r ip=%r id=%r qty=%r"
+                            % (
+                                si.get("item_type"),
+                                si.get("item_price_id"),
+                                si.get("id"),
+                                si.get("quantity"),
+                            )
+                        )
+                    log.warning(
+                        "No CRM add-on lines matched this webhook (subscription_id=%s). "
+                        "Parsed %s line object(s): %s | CHARGEBEE_ADDON_IDS exact=%s | prefix=%s",
+                        subscription_id,
+                        len(items),
+                        "; ".join(brief[:15]) if brief else "(none — check content.subscription line keys)",
+                        sorted(exact) if exact else "(unset)",
+                        ADDON_ITEM_PRICE_ID_PREFIXES,
                     )
             if pending:
                 sf = _get_salesforce()
