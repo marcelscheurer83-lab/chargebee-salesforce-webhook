@@ -25,7 +25,8 @@ Products: creates a Quote on the expansion Opportunity, adds QuoteLineItems (sea
 enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId). Expansion can set Amended_Contract__c from
 the latest Closed Won NB/Renewal Opportunity’s ContractId (SF_OPP_AMENDED_CONTRACT_*). Optionally
 SF_OPP_POPULATE_CONTRACT_LOOKUP + SOQL sets Opportunity ContractId. After each successful webhook,
-line quantities are synced from the payload, then optionally merged from Chargebee.
+line quantities are synced from the payload, then optionally merged from Chargebee. Prorated Term (Months)
+(SF_USE_PRORATED_TERM_MONTHS) and ServiceDate on lines help match co-termed expansion subscription quotes.
 """
 
 from __future__ import annotations
@@ -263,6 +264,42 @@ def _months_between_start_and_end(start: date, end: date) -> int:
     if end < start:
         return 0
     return max(0, (end.year - start.year) * 12 + (end.month - start.month))
+
+
+def _prorated_term_months(start: date, end: date) -> float:
+    """
+    Fractional months from calendar day span (matches common CPQ co-term math: days / (365.25/12)).
+    E.g. 364 days ≈ 11.97 months — aligns manual expansion quotes where Term (Months) is decimal.
+    """
+    if end <= start:
+        return 0.0
+    days = (end - start).days
+    months = days / (365.25 / 12.0)
+    try:
+        nd = int((sf_cfg("SF_PRORATED_TERM_DECIMALS") or "2").strip() or "2")
+    except ValueError:
+        nd = 2
+    nd = max(0, min(6, nd))
+    return round(months, nd)
+
+
+def _expansion_term_months(sync_date: date, contract_end: date | None) -> float | None:
+    """Quote + line term: prorated (SF_USE_PRORATED_TERM_MONTHS) or whole calendar months."""
+    if contract_end is None:
+        return None
+    if _truthy_cfg("SF_USE_PRORATED_TERM_MONTHS"):
+        return _prorated_term_months(sync_date, contract_end)
+    cal = _months_between_start_and_end(sync_date, contract_end)
+    return float(cal) if cal > 0 else None
+
+
+def _line_item_end_date_from_contract(contract_end: date) -> date:
+    """Apply SF_OLI_END_DATE_OFFSET_DAYS (e.g. -1 when line End Date is day before Contract End)."""
+    try:
+        off = int((sf_cfg("SF_OLI_END_DATE_OFFSET_DAYS") or "0").strip() or "0")
+    except ValueError:
+        off = 0
+    return contract_end + timedelta(days=off)
 
 
 def _opportunity_mrr_field_updates(amount: float | None) -> dict[str, float]:
@@ -557,7 +594,7 @@ def _create_expansion_opportunity(
     amount: float | None,
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
     contract_id: str | None = None,
     amended_contract_id: str | None = None,
 ) -> str:
@@ -757,7 +794,7 @@ def _product_line_custom_fields(
     *,
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
 ) -> dict[str, Any]:
     """Optional custom fields for QuoteLineItem (SF_OLI_* env names kept for backward compatibility)."""
     out: dict[str, Any] = {}
@@ -767,7 +804,7 @@ def _product_line_custom_fields(
     if start_f and _valid_sf_field_api_name(start_f):
         out[start_f] = _sf_date_payload(sync_date)
     if end_f and _valid_sf_field_api_name(end_f) and contract_end is not None:
-        out[end_f] = _sf_date_payload(contract_end)
+        out[end_f] = _sf_date_payload(_line_item_end_date_from_contract(contract_end))
     if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
         out[term_f] = float(term_months)
     return out
@@ -810,7 +847,7 @@ def _merge_quote_header_custom_fields(
     *,
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
     amount: float | None,
 ) -> None:
     """Map org-specific Quote fields (contract dates, term, autorenew, MRR/ARR from seat-delta total)."""
@@ -891,8 +928,8 @@ def _merge_quote_financial_header_fields(body: dict[str, Any], amount: float | N
 
 def _quotelineitem_extra_fields_from_config() -> dict[str, Any]:
     """
-    Optional JSON object merged into each QuoteLineItem create (e.g. charge type / recurring picklist).
-    SF_QUOTELINEITEM_STATIC_FIELDS_JSON='{"Some_Field__c":"Recurring"}' — keys must be valid API names.
+    Optional JSON object merged into each QuoteLineItem create (e.g. subscription / price-basis picklists
+    that mirror your “Add Products” wizard). Keys must be valid API names; values must match picklist API values.
     """
     raw = (sf_cfg("SF_QUOTELINEITEM_STATIC_FIELDS_JSON") or "").strip()
     if not raw:
@@ -917,7 +954,7 @@ def _patch_quote_header_after_create(
     *,
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
     amount: float | None,
 ) -> None:
     """
@@ -1207,7 +1244,7 @@ def _create_expansion_quote(
     pb2_id: str,
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
     amount: float | None,
 ) -> str | None:
     tmpl = sf_cfg("SF_QUOTE_NAME_TEMPLATE", "Expansion quote (+{delta} CRM self-serve seats)")
@@ -1285,7 +1322,7 @@ def _add_quote_line_items(
     *,
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
 ) -> None:
     """One QuoteLineItem per Chargebee line; Quantity = seat delta for this event."""
     extras = _product_line_custom_fields(
@@ -1303,6 +1340,10 @@ def _add_quote_line_items(
             **qli_static,
             **extras,
         }
+        if _truthy_cfg("SF_QTI_SET_STANDARD_SERVICE_DATE"):
+            body["ServiceDate"] = sync_date.isoformat()
+        if contract_end is not None and _truthy_cfg("SF_QTI_SET_STANDARD_END_DATE"):
+            body["EndDate"] = _line_item_end_date_from_contract(contract_end).isoformat()
         if up is not None:
             body["UnitPrice"] = round(up, 2)
             line_mrr = round(float(up) * float(delta), 2)
@@ -1365,7 +1406,7 @@ def _attach_expansion_quote_and_lines(
     pending: list[tuple[str, int, int, str, float | None]],
     sync_date: date,
     contract_end: date | None,
-    term_months: int | None,
+    term_months: float | None,
     amount: float | None,
 ) -> None:
     """Create Quote on Opportunity and add QuoteLineItems (seat deltas)."""
@@ -1552,9 +1593,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                         amount = amt_sum
                     desc = "\n".join(parts)
                     contract_end = _query_expansion_contract_end_from_renewal(sf, account_id)
-                    term_months: int | None = None
-                    if contract_end is not None:
-                        term_months = _months_between_start_and_end(sync_date, contract_end)
+                    term_months = _expansion_term_months(sync_date, contract_end)
                     oid = _create_expansion_opportunity(
                         sf,
                         company=company,
