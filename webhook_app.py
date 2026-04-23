@@ -1381,6 +1381,20 @@ def _create_expansion_quote(
     return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
 
 
+def _quote_line_item_description(delta: int, item_price_id: str) -> str | None:
+    """Optional Line Item Description from SF_QTI_DESCRIPTION_TEMPLATE (mirrors manual quotes)."""
+    tmpl = (sf_cfg("SF_QTI_DESCRIPTION_TEMPLATE") or "").strip()
+    if not tmpl:
+        return None
+    product_name = (sf_cfg("SF_PRODUCT_NAME", "Additional CRM Seats") or "Additional CRM Seats").strip()
+    try:
+        text = tmpl.format(delta=delta, item_price_id=item_price_id, product_name=product_name)
+    except (KeyError, ValueError, IndexError):
+        log.warning("SF_QTI_DESCRIPTION_TEMPLATE is invalid for format(); check placeholders")
+        return None
+    return text.strip()[:255]
+
+
 def _add_quote_line_items(
     sf: Salesforce,
     quote_id: str,
@@ -1407,6 +1421,9 @@ def _add_quote_line_items(
             **qli_static,
             **extras,
         }
+        desc = _quote_line_item_description(delta, ip_id)
+        if desc:
+            body["Description"] = desc
         if _truthy_cfg("SF_QTI_SET_STANDARD_SERVICE_DATE"):
             body["ServiceDate"] = sync_date.isoformat()
         if contract_end is not None and _truthy_cfg("SF_QTI_SET_STANDARD_END_DATE"):
