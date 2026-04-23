@@ -16,7 +16,7 @@
   "SF_QUOTE_CONTRACT_END_DATE_FIELD": "Contract_End_Date__c",
   "SF_QUOTE_TERM_MONTHS_FIELD": "Term_Months__c",
   "SF_QUOTE_AUTORENEW_FIELD": "Auto_Renew__c",
-  "SF_QUOTE_AUTORENEW_VALUE": "true",
+  "SF_QUOTE_AUTORENEW_VALUE": "Yes",
   "SF_OLI_START_DATE_FIELD": "Start_Date__c",
   "SF_OLI_END_DATE_FIELD": "End_Date__c",
   "SF_OLI_TERM_MONTHS_FIELD": "Term_Months__c",

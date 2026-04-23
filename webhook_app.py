@@ -14,16 +14,16 @@ Chargebee: Settings → Configure Chargebee → Webhooks
 State file WEBHOOK_STATE_PATH defaults to ./webhook_state.json inside the container; use a volume
 if you need quantities to survive redeploys (otherwise the next event re-baselines without an opp).
 
-Run `python seed_webhook_state.py` (with Chargebee API env vars) or POST `/admin/seed-state` with
-header `X-Seed-Secret` (= `WEBHOOK_SEED_SECRET`) to merge current Chargebee quantities into state.
-
-If a subscription line has no stored quantity yet, we treat the prior quantity as 0 so the
-first seats added (e.g. 0→1) create an Opportunity. Run seed_webhook_state (or POST /admin/seed-state)
-so existing high quantities in Chargebee are in state before go-live—otherwise the first webhook
-after deploy could count the full current qty as "new" seats.
+By default, after each successfully processed webhook we merge all active self-serve line quantities
+from the Chargebee API into state (same data as seed_webhook_state / POST /admin/seed-state), so
+baselines stay aligned without a manual seed. Disable with WEBHOOK_MERGE_CHARGEBEE_STATE_ON_WEBHOOK=0
+if you prefer fewer API calls. Manual seed is still useful before go-live if state is empty: the
+first increase is computed before this merge, so a cold start can still treat the full current qty
+as delta unless you seeded or use a persistent volume with prior quantities.
 
 Products: always creates a Quote on the expansion Opportunity and adds QuoteLineItems (seat delta qty).
-After each successfully processed webhook, self-serve line quantities in state are synced from the payload.
+After each successfully processed webhook, self-serve line quantities are synced from the payload,
+then optionally merged from the Chargebee API (see above).
 """
 
 from __future__ import annotations
@@ -47,7 +47,10 @@ from chargebee_client import (
     _crm_addon_line_matches,
     self_service_line_state_key,
 )
-from seed_webhook_state import merge_chargebee_into_state_file
+from seed_webhook_state import (
+    merge_chargebee_into_state_file,
+    merge_chargebee_line_quantities_into_dict,
+)
 from sf_config import init_sf_config, sf_cfg
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -64,6 +67,11 @@ _STATE_PATH = Path(
 )
 
 log.info("Expansion pricing: Quote + QuoteLineItems (standard); quote lines use seat delta quantity")
+
+
+def _merge_chargebee_state_after_webhook_enabled() -> bool:
+    raw = (os.getenv("WEBHOOK_MERGE_CHARGEBEE_STATE_ON_WEBHOOK") or "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _sync_self_service_quantities_from_subscription(
@@ -158,6 +166,8 @@ def _salesforce_error_entries(exc: BaseException) -> list[dict[str, Any]]:
             return []
         if isinstance(parsed, list):
             return [x for x in parsed if isinstance(x, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
         return []
     if isinstance(raw, str):
         try:
@@ -166,6 +176,8 @@ def _salesforce_error_entries(exc: BaseException) -> list[dict[str, Any]]:
             return []
         if isinstance(parsed, list):
             return [x for x in parsed if isinstance(x, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
     return []
 
 
@@ -183,11 +195,18 @@ _NO_SUCH_COLUMN_RE = re.compile(r"No such column '([^']+)'", re.IGNORECASE)
 
 
 def _fields_to_drop_from_salesforce_400(exc: BaseException, body: dict[str, Any]) -> list[str]:
-    """Field API names to remove and retry: FLS errors, missing columns, etc."""
+    """Field API names to remove and retry: FLS errors, missing columns, bad picklist values, etc."""
+    _PICKLIST_AND_FIELD_ERRORS = frozenset(
+        {
+            "INVALID_FIELD_FOR_INSERT_UPDATE",
+            "INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST",
+            "DUPLICATE_VALUE",  # rarely has fields; harmless if empty
+        }
+    )
     found: list[str] = []
     for err in _salesforce_error_entries(exc):
         code = err.get("errorCode") or ""
-        if code == "INVALID_FIELD_FOR_INSERT_UPDATE":
+        if code in _PICKLIST_AND_FIELD_ERRORS:
             found.extend(str(f) for f in (err.get("fields") or []) if f)
         elif code == "INVALID_FIELD":
             msg = str(err.get("message") or "")
@@ -589,15 +608,35 @@ def _product_line_custom_fields(
 
 
 def _sf_quote_autorenew_payload() -> Any | None:
+    """
+    Auto Renew is usually a restricted picklist (API values Yes / No).
+    SF_CONFIG_JSON booleans become the strings \"true\"/\"false\" in sf_cfg — those are not valid
+    picklist tokens unless the org defines them; we map them to Yes/No unless checkbox mode is on.
+
+    Set SF_QUOTE_AUTORENEW_AS_BOOLEAN=1 only if the field is a real checkbox (not a picklist).
+    Do not set SF_QUOTE_AUTORENEW_AS_BOOLEAN to JSON true unless you mean checkbox mode.
+    """
     raw = sf_cfg("SF_QUOTE_AUTORENEW_VALUE")
     if not raw:
         return None
+    as_checkbox = (sf_cfg("SF_QUOTE_AUTORENEW_AS_BOOLEAN") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     low = raw.lower()
+    if as_checkbox:
+        if low in ("1", "true", "yes"):
+            return True
+        if low in ("0", "false", "no"):
+            return False
+        return raw.strip()
+
     if low in ("1", "true", "yes"):
-        return True
+        return "Yes"
     if low in ("0", "false", "no"):
-        return False
-    return raw
+        return "No"
+    return raw.strip()
 
 
 def _merge_quote_header_custom_fields(
@@ -1157,6 +1196,19 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             _sync_self_service_quantities_from_subscription(
                 items, lines, subscription_id, exact
             )
+            if _merge_chargebee_state_after_webhook_enabled():
+                try:
+                    n_cb = merge_chargebee_line_quantities_into_dict(lines)
+                    log.info(
+                        "Merged %s self-serve subscription lines from Chargebee API into state",
+                        n_cb,
+                    )
+                except ValueError as e:
+                    log.warning("Chargebee state merge skipped (check CHARGEBEE_* env): %s", e)
+                except Exception:
+                    log.exception(
+                        "Chargebee state merge failed; continuing with payload-synced quantities only"
+                    )
             processed.append(event_id)
         state["processed_event_ids"] = _trim_processed_ids(processed)
         state["line_quantities"] = lines
