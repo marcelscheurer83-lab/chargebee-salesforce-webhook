@@ -1332,13 +1332,18 @@ def _log_quote_financial_fls_hint(exc: BaseException) -> None:
         return
 
 
+def _quote_patch_mrr_arr_on_quote_enabled() -> bool:
+    """Quote Total_MRR__c / Total_ARR__c API writes. Off when FLS denies or fields are formula/rollup-only."""
+    raw = (sf_cfg("SF_QUOTE_PATCH_MRR_ARR_ON_QUOTE") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _merge_quote_financial_header_fields(body: dict[str, Any], amount: float | None) -> None:
     """
-    Quote header: MRR/ARR from delta seat revenue (Chargebee unit price × delta qty).
-    Optional SF_QUOTE_ONETIME_FEES_FIELD set to 0 when the org stores one-time total there
-    (often a manual or rollup field; formula/read-only fields are dropped on retry).
+    Quote header: optional MRR/ARR from delta seat revenue; optional one-time=0 on writable currency.
+    Set SF_QUOTE_PATCH_MRR_ARR_ON_QUOTE=0 when the integration user cannot edit header MRR/ARR (skips retries).
     """
-    if amount is not None:
+    if amount is not None and _quote_patch_mrr_arr_on_quote_enabled():
         mrr_f = sf_cfg("SF_QUOTE_MRR_FIELD")
         if mrr_f and _valid_sf_field_api_name(mrr_f):
             body[mrr_f] = round(float(amount), 2)

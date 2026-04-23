@@ -24,6 +24,7 @@
   "SF_QUOTE_AUTORENEW_VALUE": "Yes",
   "SF_QUOTE_MRR_FIELD": "Total_MRR__c",
   "SF_QUOTE_ARR_FIELD": "Total_ARR__c",
+  "SF_QUOTE_PATCH_MRR_ARR_ON_QUOTE": "false",
   "SF_QUOTE_ONETIME_FEES_FIELD_DISABLE": "true",
   "SF_OLI_START_DATE_FIELD": "Start_Date__c",
   "SF_OLI_END_DATE_FIELD": "End_Date__c",
