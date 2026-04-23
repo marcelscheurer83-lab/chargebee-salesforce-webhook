@@ -660,6 +660,60 @@ def _try_set_quote_syncing(sf: Salesforce, quote_id: str) -> None:
         log.warning("Could not set quote sync (%s): %s", patch, exc)
 
 
+def _quote_expiration_date_iso() -> str:
+    exp_raw = (sf_cfg("SF_QUOTE_EXPIRATION_DAYS", "30") or "30").strip() or "30"
+    try:
+        exp_days = max(1, int(exp_raw))
+    except ValueError:
+        exp_days = 30
+    return (datetime.now(_event_timezone()).date() + timedelta(days=exp_days)).isoformat()
+
+
+def _create_expansion_quote_minimal(
+    sf: Salesforce,
+    opp_id: str,
+    *,
+    name: str,
+    pb2_id: str,
+) -> str | None:
+    """Standard Quote fields only (no custom header map). Use when full create keeps failing."""
+    body: dict[str, Any] = {
+        "OpportunityId": opp_id,
+        "Name": name[:255],
+        "Pricebook2Id": pb2_id,
+        "ExpirationDate": _quote_expiration_date_iso(),
+    }
+    st = sf_cfg("SF_QUOTE_STATUS", "Draft")
+    if st:
+        body["Status"] = st
+    qc = sf_cfg("SF_QUOTE_CONTACT_ID")
+    if qc:
+        body["ContactId"] = qc
+    attempts: list[dict[str, Any]] = [body]
+    if "Status" in body:
+        lean = {k: v for k, v in body.items() if k != "Status"}
+        attempts.append(lean)
+    for variant in attempts:
+        try:
+            result = sf.Quote.create(variant)
+            qid = result.get("id")
+            if not qid:
+                raise RuntimeError(f"Salesforce Quote.create unexpected response: {result}")
+            log.warning(
+                "Created Quote %s with minimal fields only (custom quote field map skipped). "
+                "Add formulas/flow or fix SF_CONFIG_JSON for Contract/MRR/ARR on Quote.",
+                qid,
+            )
+            return str(qid)
+        except Exception as exc:
+            last_exc = exc
+            if variant is attempts[-1]:
+                _log_salesforce_failure("Quote.create (minimal fallback)", exc, variant)
+            else:
+                log.warning("Quote minimal create failed with Status; retrying without Status: %s", exc)
+    return None
+
+
 def _create_expansion_quote(
     sf: Salesforce,
     opp_id: str,
@@ -686,14 +740,7 @@ def _create_expansion_quote(
     qc = sf_cfg("SF_QUOTE_CONTACT_ID")
     if qc:
         body["ContactId"] = qc
-    exp_raw = (sf_cfg("SF_QUOTE_EXPIRATION_DAYS", "30") or "30").strip() or "30"
-    try:
-        exp_days = max(1, int(exp_raw))
-    except ValueError:
-        exp_days = 30
-    body["ExpirationDate"] = (
-        datetime.now(_event_timezone()).date() + timedelta(days=exp_days)
-    ).isoformat()
+    body["ExpirationDate"] = _quote_expiration_date_iso()
     _merge_quote_header_custom_fields(
         body,
         sync_date=sync_date,
@@ -716,19 +763,19 @@ def _create_expansion_quote(
             status = getattr(exc, "status", None)
             if status is None:
                 _log_salesforce_failure("Quote.create", exc, body)
-                return None
+                return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
             try:
                 code = int(status)
             except (TypeError, ValueError):
                 _log_salesforce_failure("Quote.create", exc, body)
-                return None
+                return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
             if code != 400:
                 _log_salesforce_failure("Quote.create", exc, body)
-                return None
+                return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
             drop = _fields_to_drop_from_salesforce_400(exc, body)
             if not drop:
                 _log_salesforce_failure("Quote.create", exc, body)
-                return None
+                break
             removed = False
             for f in drop:
                 if f in body:
@@ -736,14 +783,14 @@ def _create_expansion_quote(
                     removed = True
             if not removed:
                 _log_salesforce_failure("Quote.create", exc, body)
-                return None
+                break
             log.warning(
                 "Retrying Quote.create without bad/missing fields: %s",
                 drop,
             )
     if last_exc:
-        _log_salesforce_failure("Quote.create", last_exc, body)
-    return None
+        _log_salesforce_failure("Quote.create (full field set exhausted)", last_exc, body)
+    return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
 
 
 def _add_quote_line_items(
@@ -838,9 +885,15 @@ def _attach_expansion_quote_and_lines(
     """Create Quote on Opportunity and add QuoteLineItems (seat deltas)."""
     resolved = _resolve_pricebook_entry(sf)
     if not resolved:
+        log.error(
+            "Cannot create Quote: no PricebookEntry resolved (check SF_PRODUCT_NAME / "
+            "SF_PRODUCT2_ID / SF_PRICEBOOK_ENTRY_ID in SF_CONFIG_JSON). opp=%s",
+            opp_id,
+        )
         return
     pbe_id, pb2_id = resolved
     if not _ensure_opportunity_pricebook(sf, opp_id, pb2_id):
+        log.error("Cannot create Quote: failed to set Opportunity Pricebook2Id=%s opp=%s", pb2_id, opp_id)
         return
     qid = _create_expansion_quote(
         sf,
@@ -854,6 +907,11 @@ def _attach_expansion_quote_and_lines(
         amount=amount,
     )
     if not qid:
+        log.error(
+            "Quote was not created after full + minimal attempts. opp=%s — search Salesforce "
+            "for standard Quote (not only CPQ SBQQ quotes) or check Quote object permissions.",
+            opp_id,
+        )
         return
     _add_quote_line_items(
         sf,
