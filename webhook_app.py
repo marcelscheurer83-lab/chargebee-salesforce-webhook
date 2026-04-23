@@ -1538,6 +1538,63 @@ def _create_expansion_quote(
     return _create_expansion_quote_minimal(sf, opp_id, name=name, pb2_id=pb2_id)
 
 
+def _patch_quotelineitem_contract_dates(
+    sf: Salesforce,
+    qli_id: str,
+    *,
+    sync_date: date,
+    contract_end: date | None,
+    term_months: float | None,
+) -> None:
+    """
+    After QuoteLineItem.create, set custom End_Date__c / Term / Start to match the Quote header and Won opp.
+
+    Some orgs reject End_Date__c on insert (FLS/validation); create then drops the field and Salesforce
+    may default line End Date one day early. This update aligns the line with contract_end exactly.
+    """
+    if contract_end is None:
+        return
+    patch: dict[str, Any] = {}
+    end_f = sf_cfg("SF_OLI_END_DATE_FIELD")
+    if end_f and _valid_sf_field_api_name(end_f):
+        patch[end_f] = _sf_date_payload(contract_end)
+    # Standard EndDate aligns line with header when the org exposes it; 400 retry drops if not.
+    patch["EndDate"] = contract_end.isoformat()
+    term_f = sf_cfg("SF_OLI_TERM_MONTHS_FIELD")
+    if term_f and _valid_sf_field_api_name(term_f) and term_months is not None:
+        patch[term_f] = float(term_months)
+    start_f = sf_cfg("SF_OLI_START_DATE_FIELD")
+    if start_f and _valid_sf_field_api_name(start_f):
+        patch[start_f] = _sf_date_payload(sync_date)
+    if not patch:
+        return
+    ok, err = _sf_update_with_400_retries(
+        sf,
+        update_callable=sf.QuoteLineItem.update,
+        record_id=qli_id,
+        patch=dict(patch),
+        retry_label="QuoteLineItem.update (contract dates)",
+    )
+    if ok:
+        log.info("Patched QuoteLineItem %s contract dates: %s", qli_id, sorted(patch.keys()))
+    elif err:
+        log.warning(
+            "QuoteLineItem contract date patch incomplete for %s (grant FLS on %s): %s",
+            qli_id,
+            ", ".join(sorted(patch.keys())),
+            err,
+        )
+
+
+def _skip_expansion_when_baseline_missing() -> bool:
+    return (os.getenv("WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _quote_line_item_description(delta: int, item_price_id: str) -> str | None:
     """Optional Line Item Description from SF_QTI_DESCRIPTION_TEMPLATE (mirrors manual quotes)."""
     tmpl = (sf_cfg("SF_QTI_DESCRIPTION_TEMPLATE") or "").strip()
@@ -1598,7 +1655,8 @@ def _add_quote_line_items(
         last_li: BaseException | None = None
         for _attempt in range(8):
             try:
-                sf.QuoteLineItem.create(body)
+                result = sf.QuoteLineItem.create(body)
+                qli_id = str(result.get("id") or "") if isinstance(result, dict) else ""
                 log.info(
                     "Added QuoteLineItem quote=%s qty=%s (delta) unit_price=%s item_price_id=%s",
                     quote_id,
@@ -1606,6 +1664,14 @@ def _add_quote_line_items(
                     up,
                     ip_id,
                 )
+                if qli_id:
+                    _patch_quotelineitem_contract_dates(
+                        sf,
+                        qli_id,
+                        sync_date=sync_date,
+                        contract_end=contract_end,
+                        term_months=term_months,
+                    )
                 li_ok = True
                 break
             except Exception as exc:
@@ -1825,9 +1891,19 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 log.warning(
                     "No stored baseline for self-serve line %s; treating prior qty as 0 for this delta. "
                     "If you just redeployed, seed WEBHOOK_STATE_PATH (POST /admin/seed-state or "
-                    "seed_webhook_state.py) so the next increase is only the real delta.",
+                    "seed_webhook_state.py) so the next increase is only the real delta. "
+                    "Or set WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING=1 to block expansion until seeded.",
                     key,
                 )
+            if stored is None and _skip_expansion_when_baseline_missing():
+                if new_qty > old_qty:
+                    log.error(
+                        "Skipping expansion for line %s (Chargebee qty=%s): "
+                        "WEBHOOK_SKIP_EXPANSION_IF_BASELINE_MISSING is on and state has no baseline.",
+                        key,
+                        new_qty,
+                    )
+                continue
             if new_qty <= old_qty:
                 continue
 
