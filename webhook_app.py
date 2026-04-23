@@ -856,18 +856,65 @@ def _patch_quote_financials_after_line_items(
         )
 
 
+def _sf_update_with_400_retries(
+    sf: Salesforce,
+    *,
+    update_callable: Any,
+    record_id: str,
+    patch: dict[str, Any],
+    retry_label: str,
+) -> tuple[bool, BaseException | None]:
+    """Return (ok, last_error). Retries on HTTP 400 by dropping fields Salesforce names in the error."""
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            update_callable(record_id, patch)
+            return True, None
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                log.warning("%s: non-HTTP error for id=%s: %s", retry_label, record_id, exc)
+                return False, last_exc
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                log.warning("%s: unexpected status=%r for id=%s: %s", retry_label, status, record_id, exc)
+                return False, last_exc
+            if code != 400:
+                log.warning("%s: HTTP %s for id=%s: %s", retry_label, code, record_id, exc)
+                return False, last_exc
+            drop = _fields_to_drop_from_salesforce_400(exc, patch)
+            if not drop:
+                return False, last_exc
+            removed = False
+            for f in drop:
+                if f in patch:
+                    patch.pop(f)
+                    removed = True
+            if not removed or not patch:
+                return False, last_exc
+            log.warning("%s: retry without bad fields %s", retry_label, drop)
+    return False, last_exc
+
+
 def _try_set_quote_syncing(sf: Salesforce, opp_id: str, quote_id: str) -> None:
     """
-    Standard Salesforce Quote: turn on sync so QuoteLineItems mirror to OpportunityLineItem on this Opp.
-    Then set Opportunity.SyncedQuoteId to this quote when allowed (UI + rollups treat it as the synced quote).
+    Standard Salesforce Quote: link the Opportunity to this Quote (SyncedQuoteId), then set the Quote
+    sync flag (IsSyncing or SF_QUOTE_SYNCING_FIELD) so line items mirror to OpportunityLineItem.
 
-    Custom checkbox/picklist instead of IsSyncing: SF_QUOTE_SYNCING_FIELD + SF_QUOTE_SYNCING_VALUE.
+    Order matches common API expectations: Opportunity first, then Quote. If the layout shows a custom
+    \"Syncing\" checkbox instead of standard IsSyncing, set SF_QUOTE_SYNCING_FIELD to that API name.
+
     CPQ (SBQQ__Quote__c) uses a different model — this targets standard Quote + Opportunity only.
 
     Disable Opportunity.SyncedQuoteId patch with SF_QUOTE_SET_OPPORTUNITY_SYNCED_QUOTE_ID=0 if your org rejects it.
     """
-    if (sf_cfg("SF_QUOTE_SYNC_TO_OPPORTUNITY", "1") or "").strip().lower() in ("0", "false", "no"):
+    sync_raw = (sf_cfg("SF_QUOTE_SYNC_TO_OPPORTUNITY", "1") or "").strip().lower()
+    if sync_raw in ("0", "false", "no", "off"):
+        log.info("Quote→Opp sync skipped (SF_QUOTE_SYNC_TO_OPPORTUNITY is off)")
         return
+
     alt = sf_cfg("SF_QUOTE_SYNCING_FIELD")
     if alt and _valid_sf_field_api_name(alt):
         vraw = sf_cfg("SF_QUOTE_SYNCING_VALUE", "true")
@@ -879,91 +926,56 @@ def _try_set_quote_syncing(sf: Salesforce, opp_id: str, quote_id: str) -> None:
         else:
             val = vraw
         q_patch: dict[str, Any] = {alt: val}
+        sync_field_desc = alt
     else:
         q_patch = {"IsSyncing": True}
+        sync_field_desc = "IsSyncing"
 
-    quote_sync_ok = False
-    last_q: BaseException | None = None
-    for _attempt in range(8):
-        try:
-            sf.Quote.update(quote_id, q_patch)
-            log.info(
-                "Quote → Opportunity sync enabled on Quote %s (keys=%s)",
-                quote_id,
-                list(q_patch.keys()),
-            )
-            quote_sync_ok = True
-            break
-        except Exception as exc:
-            last_q = exc
-            status = getattr(exc, "status", None)
-            if status is None:
-                break
-            try:
-                code = int(status)
-            except (TypeError, ValueError):
-                break
-            if code != 400:
-                break
-            drop = _fields_to_drop_from_salesforce_400(exc, q_patch)
-            if not drop:
-                break
-            removed = False
-            for f in drop:
-                if f in q_patch:
-                    q_patch.pop(f)
-                    removed = True
-            if not removed or not q_patch:
-                break
-            log.warning("Retrying Quote.update (sync flag) without bad fields: %s", drop)
+    log.info(
+        "Quote→Opp sync: opp=%s quote=%s (will set SyncedQuoteId then %s)",
+        opp_id,
+        quote_id,
+        sync_field_desc,
+    )
 
-    if not quote_sync_ok:
-        if last_q:
-            log.warning("Could not set quote sync flag on %s: %s", quote_id, last_q)
-        return
-
-    if (sf_cfg("SF_QUOTE_SET_OPPORTUNITY_SYNCED_QUOTE_ID", "1") or "").strip().lower() in (
+    if (sf_cfg("SF_QUOTE_SET_OPPORTUNITY_SYNCED_QUOTE_ID", "1") or "").strip().lower() not in (
         "0",
         "false",
         "no",
+        "off",
     ):
-        return
-
-    o_patch: dict[str, Any] = {"SyncedQuoteId": quote_id}
-    last_o: BaseException | None = None
-    for _attempt in range(8):
-        try:
-            sf.Opportunity.update(opp_id, o_patch)
+        o_patch: dict[str, Any] = {"SyncedQuoteId": quote_id}
+        ok_o, err_o = _sf_update_with_400_retries(
+            sf,
+            update_callable=sf.Opportunity.update,
+            record_id=opp_id,
+            patch=o_patch,
+            retry_label="Opportunity.update (SyncedQuoteId)",
+        )
+        if ok_o:
             log.info("Opportunity %s SyncedQuoteId set to Quote %s", opp_id, quote_id)
-            return
-        except Exception as exc:
-            last_o = exc
-            status = getattr(exc, "status", None)
-            if status is None:
-                break
-            try:
-                code = int(status)
-            except (TypeError, ValueError):
-                break
-            if code != 400:
-                break
-            drop = _fields_to_drop_from_salesforce_400(exc, o_patch)
-            if not drop:
-                break
-            removed = False
-            for f in drop:
-                if f in o_patch:
-                    o_patch.pop(f)
-                    removed = True
-            if not removed or not o_patch:
-                break
-            log.warning("Retrying Opportunity.update (SyncedQuoteId) without bad fields: %s", drop)
+        elif err_o:
+            log.warning(
+                "Opportunity.SyncedQuoteId not set (continuing with Quote sync flag). opp=%s err=%s",
+                opp_id,
+                err_o,
+            )
 
-    if last_o:
+    ok_q, err_q = _sf_update_with_400_retries(
+        sf,
+        update_callable=sf.Quote.update,
+        record_id=quote_id,
+        patch=q_patch,
+        retry_label="Quote.update (sync)",
+    )
+    if ok_q:
+        log.info("Quote → Opportunity sync enabled on %s (keys=%s)", quote_id, list(q_patch.keys()))
+    elif err_q:
         log.warning(
-            "Could not set Opportunity.SyncedQuoteId (Quote.IsSyncing may still drive line sync). opp=%s err=%s",
-            opp_id,
-            last_o,
+            "Could not set quote sync flag on %s (%s). Check FLS on Quote.%s and validation rules.",
+            quote_id,
+            err_q,
+            sync_field_desc,
         )
 
 
