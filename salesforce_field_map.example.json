@@ -6,7 +6,6 @@
   "SF_OPP_CONTRACT_END_DATE_FIELD": "Contract_End_Date__c",
   "SF_OPP_TERM_MONTHS_FIELD": "Term_Months__c",
   "SF_OPP_MRR_FIELD": "MRR__c",
-  "SF_OPP_EXPANSION_MRR_FIELD": "Expansion_MRR__c",
   "SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME": "Renewal",
   "SF_RENEWAL_CONTRACT_START_DATE_FIELD": "Contract_Start_Date__c",
   "SF_PRODUCT_NAME": "Additional CRM Seats",
@@ -18,10 +17,9 @@
   "SF_QUOTE_AUTORENEW_FIELD": "Auto_Renew__c",
   "SF_QUOTE_AUTORENEW_VALUE": "true",
   "SF_QUOTE_MRR_FIELD": "Total_MRR__c",
-  "SF_QUOTE_ARR_FIELD": "Total_ARR__c",
   "SF_OLI_START_DATE_FIELD": "Start_Date__c",
   "SF_OLI_END_DATE_FIELD": "End_Date__c",
   "SF_OLI_TERM_MONTHS_FIELD": "Term_Months__c",
   "SF_QTI_MRR_FIELD": "MRR__c",
-  "SF_QTI_ARR_FIELD": "ARR__c"
+  "SF_EVENT_TIMEZONE": "America/New_York"
 }

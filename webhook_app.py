@@ -33,9 +33,10 @@ import logging
 import os
 import re
 import threading
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -178,14 +179,51 @@ def _invalid_field_names_from_salesforce(exc: BaseException) -> list[str]:
     return out
 
 
+_NO_SUCH_COLUMN_RE = re.compile(r"No such column '([^']+)'", re.IGNORECASE)
+
+
+def _fields_to_drop_from_salesforce_400(exc: BaseException, body: dict[str, Any]) -> list[str]:
+    """Field API names to remove and retry: FLS errors, missing columns, etc."""
+    found: list[str] = []
+    for err in _salesforce_error_entries(exc):
+        code = err.get("errorCode") or ""
+        if code == "INVALID_FIELD_FOR_INSERT_UPDATE":
+            found.extend(str(f) for f in (err.get("fields") or []) if f)
+        elif code == "INVALID_FIELD":
+            msg = str(err.get("message") or "")
+            m = _NO_SUCH_COLUMN_RE.search(msg)
+            if m:
+                found.append(m.group(1))
+    out: list[str] = []
+    seen: set[str] = set()
+    for f in found:
+        if f in body and f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _event_timezone() -> ZoneInfo:
+    """Default America/New_York (Miami / Eastern). Override with SF_EVENT_TIMEZONE."""
+    name = (sf_cfg("SF_EVENT_TIMEZONE", "America/New_York") or "America/New_York").strip()
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        log.warning("Invalid SF_EVENT_TIMEZONE %r; using America/New_York", name)
+        return ZoneInfo("America/New_York")
+
+
 def _event_sync_date(payload: dict[str, Any]) -> date:
+    """Event calendar date in SF_EVENT_TIMEZONE (default Eastern / Miami), not UTC."""
+    tz = _event_timezone()
     ts = payload.get("occurred_at")
     if ts is not None:
         try:
-            return datetime.utcfromtimestamp(int(ts)).date()
+            dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            return dt_utc.astimezone(tz).date()
         except (TypeError, ValueError, OSError):
             pass
-    return datetime.utcnow().date()
+    return datetime.now(tz).date()
 
 
 def _parse_sf_date(val: Any) -> date | None:
@@ -356,7 +394,7 @@ def _create_expansion_opportunity(
         close_d = sync_date
     else:
         close_days = int((sf_cfg("SF_OPPORTUNITY_CLOSE_DAYS", "30") or "30").strip() or "30")
-        close_d = date.today() + timedelta(days=close_days)
+        close_d = datetime.now(_event_timezone()).date() + timedelta(days=close_days)
     name = (sf_cfg("SF_OPPORTUNITY_NAME_TEMPLATE", "Expansion: {company} (+{delta} CRM self-serve seats)")).format(
         company=company or customer_id,
         delta=total_seat_delta,
@@ -409,7 +447,7 @@ def _create_expansion_opportunity(
             if code != 400:
                 _log_salesforce_failure("Opportunity.create", exc, body)
                 raise
-            drop = _invalid_field_names_from_salesforce(exc)
+            drop = _fields_to_drop_from_salesforce_400(exc, body)
             if not drop:
                 _log_salesforce_failure("Opportunity.create", exc, body)
                 raise
@@ -439,15 +477,49 @@ def _update_opportunity_mrr_after_products(
     patch = _opportunity_mrr_field_updates(amount)
     if not patch:
         return
-    try:
-        sf.Opportunity.update(opp_id, patch)
-        log.info("Set MRR field(s) on Opportunity %s: %s", opp_id, sorted(patch.keys()))
-    except Exception as exc:
-        _log_salesforce_failure("Opportunity.update (MRR)", exc, patch)
-        log.warning(
-            "Could not set MRR field(s) (formula/rollup, FLS, or validation). Opportunity %s still created.",
-            opp_id,
-        )
+    last_exc: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            sf.Opportunity.update(opp_id, patch)
+            log.info("Set MRR field(s) on Opportunity %s: %s", opp_id, sorted(patch.keys()))
+            return
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                break
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                break
+            if code != 400:
+                break
+            drop = _fields_to_drop_from_salesforce_400(exc, patch)
+            if not drop:
+                break
+            removed = False
+            for f in drop:
+                if f in patch:
+                    patch.pop(f)
+                    removed = True
+            if not removed or not patch:
+                break
+            log.warning(
+                "Retrying Opportunity.update (MRR) without bad fields: %s",
+                drop,
+            )
+    if last_exc:
+        if patch:
+            _log_salesforce_failure("Opportunity.update (MRR)", last_exc, patch)
+            log.warning(
+                "Could not set MRR field(s) (formula/rollup, FLS, or validation). Opportunity %s still created.",
+                opp_id,
+            )
+        else:
+            log.info(
+                "Skipped MRR update on Opportunity %s (all mapped fields were invalid or non-writable).",
+                opp_id,
+            )
 
 
 def _resolve_pricebook_entry(sf: Salesforce) -> tuple[str, str] | None:
@@ -619,7 +691,9 @@ def _create_expansion_quote(
         exp_days = max(1, int(exp_raw))
     except ValueError:
         exp_days = 30
-    body["ExpirationDate"] = (date.today() + timedelta(days=exp_days)).isoformat()
+    body["ExpirationDate"] = (
+        datetime.now(_event_timezone()).date() + timedelta(days=exp_days)
+    ).isoformat()
     _merge_quote_header_custom_fields(
         body,
         sync_date=sync_date,
@@ -651,7 +725,7 @@ def _create_expansion_quote(
             if code != 400:
                 _log_salesforce_failure("Quote.create", exc, body)
                 return None
-            drop = _invalid_field_names_from_salesforce(exc)
+            drop = _fields_to_drop_from_salesforce_400(exc, body)
             if not drop:
                 _log_salesforce_failure("Quote.create", exc, body)
                 return None
@@ -664,7 +738,7 @@ def _create_expansion_quote(
                 _log_salesforce_failure("Quote.create", exc, body)
                 return None
             log.warning(
-                "Retrying Quote.create without non-writable fields (grant FLS or map a writable field): %s",
+                "Retrying Quote.create without bad/missing fields: %s",
                 drop,
             )
     if last_exc:
@@ -705,16 +779,47 @@ def _add_quote_line_items(
             la = sf_cfg("SF_QTI_ARR_FIELD")
             if la and _valid_sf_field_api_name(la):
                 body[la] = round(line_mrr * 12.0, 2)
-        try:
-            sf.QuoteLineItem.create(body)
-            log.info(
-                "Added QuoteLineItem quote=%s qty=%s (delta) unit_price=%s item_price_id=%s",
-                quote_id,
-                qli_qty,
-                up,
-                ip_id,
-            )
-        except Exception:
+        li_ok = False
+        last_li: BaseException | None = None
+        for _attempt in range(8):
+            try:
+                sf.QuoteLineItem.create(body)
+                log.info(
+                    "Added QuoteLineItem quote=%s qty=%s (delta) unit_price=%s item_price_id=%s",
+                    quote_id,
+                    qli_qty,
+                    up,
+                    ip_id,
+                )
+                li_ok = True
+                break
+            except Exception as exc:
+                last_li = exc
+                status = getattr(exc, "status", None)
+                if status is None:
+                    break
+                try:
+                    code = int(status)
+                except (TypeError, ValueError):
+                    break
+                if code != 400:
+                    break
+                drop = _fields_to_drop_from_salesforce_400(exc, body)
+                if not drop:
+                    break
+                removed = False
+                for f in drop:
+                    if f in body:
+                        body.pop(f)
+                        removed = True
+                if not removed:
+                    break
+                log.warning(
+                    "Retrying QuoteLineItem without bad/missing fields %s item_price_id=%s",
+                    drop,
+                    ip_id,
+                )
+        if not li_ok and last_li:
             log.exception("QuoteLineItem create failed item_price_id=%s", ip_id)
 
 
