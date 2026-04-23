@@ -22,9 +22,10 @@ first increase is computed before this merge, so a cold start can still treat th
 as delta unless you seeded or use a persistent volume with prior quantities.
 
 Products: creates a Quote on the expansion Opportunity, adds QuoteLineItems (seat delta qty), then
-enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId). Optional SF_OPP_CONTRACT_LOOKUP_* links the
-Opp to a Contract on the Account (SOQL or CHARGEBEE_SUBSCRIPTION_SF_CONTRACT_FIELD). After each
-successful webhook, line quantities are synced from the payload, then optionally merged from Chargebee.
+enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId). Expansion can set Amended_Contract__c from
+the latest Closed Won NB/Renewal Opportunity’s ContractId (SF_OPP_AMENDED_CONTRACT_*). Optionally
+SF_OPP_POPULATE_CONTRACT_LOOKUP + SOQL sets Opportunity ContractId. After each successful webhook,
+line quantities are synced from the payload, then optionally merged from Chargebee.
 """
 
 from __future__ import annotations
@@ -336,7 +337,7 @@ def _resolve_sf_contract_id_for_account(
     subscription: dict[str, Any] | None,
 ) -> str | None:
     """
-    Salesforce Contract Id to store on the expansion Opportunity (lookup API name in SF_OPP_CONTRACT_LOOKUP_FIELD).
+    Salesforce Contract Id for SF_OPP_POPULATE_CONTRACT_LOOKUP + SF_OPP_CONTRACT_LOOKUP_FIELD (optional).
 
     Resolution order:
       1) Chargebee subscription custom field CHARGEBEE_SUBSCRIPTION_SF_CONTRACT_FIELD (18-char SF Id), if set.
@@ -351,10 +352,6 @@ def _resolve_sf_contract_id_for_account(
             cid = str(raw).strip()
             log.info("Contract Id from Chargebee field %s=%s", cb_field, cid)
             return cid
-
-    opp_lookup = sf_cfg("SF_OPP_CONTRACT_LOOKUP_FIELD")
-    if not opp_lookup or not _valid_sf_field_api_name(opp_lookup):
-        return None
 
     obj = (sf_cfg("SF_CONTRACT_OBJECT_API_NAME") or "Contract").strip()
     if obj not in ("Contract", "ServiceContract"):
@@ -415,6 +412,70 @@ def _resolve_sf_contract_id_for_account(
         return None
     cid = str(recs[0]["Id"])
     log.info("Resolved %s %s for expansion Opportunity (Account %s)", obj, cid, account_id)
+    return cid
+
+
+def _query_amended_contract_from_won_opportunities(sf: Salesforce, account_id: str) -> str | None:
+    """
+    Contract Id to store on SF_OPP_AMENDED_CONTRACT_FIELD: copy Opportunity.ContractId from the latest
+    Closed Won New Business or Renewal on this Account (RecordType.DeveloperName IN configured list).
+    """
+    acf = sf_cfg("SF_OPP_AMENDED_CONTRACT_FIELD")
+    if not acf or not _valid_sf_field_api_name(acf):
+        return None
+
+    rts = (sf_cfg("SF_AMENDED_CONTRACT_SOURCE_RECORD_TYPE_DEVELOPER_NAMES") or "").strip()
+    if rts:
+        names = [n.strip() for n in rts.split(",") if n.strip()]
+    else:
+        names = []
+        nb = (sf_cfg("SF_NEW_BUSINESS_RECORD_TYPE_DEVELOPER_NAME") or "").strip()
+        ren = (sf_cfg("SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME") or "Renewal").strip()
+        if nb and _valid_sf_field_api_name(nb):
+            names.append(nb)
+        if ren and _valid_sf_field_api_name(ren):
+            names.append(ren)
+    if not names:
+        log.warning(
+            "Amended_Contract: set SF_AMENDED_CONTRACT_SOURCE_RECORD_TYPE_DEVELOPER_NAMES "
+            "(comma-separated RecordType DeveloperNames) or SF_NEW_BUSINESS_RECORD_TYPE_DEVELOPER_NAME "
+            "+ SF_RENEWAL_RECORD_TYPE_DEVELOPER_NAME"
+        )
+        return None
+    for n in names:
+        if not _valid_sf_field_api_name(n):
+            log.warning("Invalid RecordType DeveloperName for amended-contract query: %s", n)
+            return None
+
+    safe_acc = _soql_escape(account_id)
+    in_list = ",".join(f"'{_soql_escape(n)}'" for n in names)
+    q = (
+        f"SELECT ContractId FROM Opportunity WHERE AccountId = '{safe_acc}' "
+        f"AND IsClosed = true AND IsWon = true AND ContractId != null "
+        f"AND RecordType.DeveloperName IN ({in_list}) "
+        f"ORDER BY CloseDate DESC LIMIT 1"
+    )
+    try:
+        res = sf.query(q)
+    except Exception:
+        log.exception("Amended Contract SOQL failed")
+        return None
+    recs = res.get("records") or []
+    if not recs:
+        log.warning(
+            "No Closed Won %s Opportunity with ContractId for Account %s",
+            names,
+            account_id,
+        )
+        return None
+    cid = str(recs[0].get("ContractId") or "").strip()
+    if not cid:
+        return None
+    log.info(
+        "Amended_Contract: using ContractId %s from latest Closed Won NB/Renewal (Account %s)",
+        cid,
+        account_id,
+    )
     return cid
 
 
@@ -498,6 +559,7 @@ def _create_expansion_opportunity(
     contract_end: date | None,
     term_months: int | None,
     contract_id: str | None = None,
+    amended_contract_id: str | None = None,
 ) -> str:
     stage = sf_cfg("SF_OPPORTUNITY_STAGE", "Prospecting")
     use_event_close = (sf_cfg("SF_OPPORTUNITY_CLOSE_DATE_USE_EVENT", "1") or "1").strip().lower() not in (
@@ -539,9 +601,14 @@ def _create_expansion_opportunity(
     if (sf_cfg("SF_OPP_MRR_SET_ON_CREATE") or "").strip().lower() in ("1", "true", "yes"):
         body.update(_opportunity_mrr_field_updates(amount))
 
-    clf = sf_cfg("SF_OPP_CONTRACT_LOOKUP_FIELD")
-    if contract_id and clf and _valid_sf_field_api_name(clf):
-        body[clf] = contract_id
+    if contract_id and _truthy_cfg("SF_OPP_POPULATE_CONTRACT_LOOKUP"):
+        clf = sf_cfg("SF_OPP_CONTRACT_LOOKUP_FIELD")
+        if clf and _valid_sf_field_api_name(clf):
+            body[clf] = contract_id
+
+    acf = sf_cfg("SF_OPP_AMENDED_CONTRACT_FIELD")
+    if amended_contract_id and acf and _valid_sf_field_api_name(acf):
+        body[acf] = amended_contract_id
 
     last_exc: BaseException | None = None
     for _attempt in range(8):
@@ -1442,13 +1509,27 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
             sf = _get_salesforce()
             account_id = _resolve_account_id(sf, customer, customer_id)
             if account_id:
-                contract_id = _resolve_sf_contract_id_for_account(sf, account_id, sync_date, sub)
+                contract_id = None
+                if _truthy_cfg("SF_OPP_POPULATE_CONTRACT_LOOKUP"):
+                    contract_id = _resolve_sf_contract_id_for_account(sf, account_id, sync_date, sub)
+                amended_contract_id = _query_amended_contract_from_won_opportunities(sf, account_id)
+
+                skip_expansion = False
                 if _truthy_cfg("SF_OPP_CONTRACT_LOOKUP_REQUIRED") and not contract_id:
                     log.error(
                         "Skipping expansion Opportunity: SF_OPP_CONTRACT_LOOKUP_REQUIRED but no Contract "
-                        "resolved for Account %s (map SF_OPP_CONTRACT_LOOKUP_FIELD and check Contract SOQL filters).",
+                        "resolved for Account %s (enable SF_OPP_POPULATE_CONTRACT_LOOKUP and SOQL filters).",
                         account_id,
                     )
+                    skip_expansion = True
+                if _truthy_cfg("SF_OPP_AMENDED_CONTRACT_REQUIRED") and not amended_contract_id:
+                    log.error(
+                        "Skipping expansion Opportunity: SF_OPP_AMENDED_CONTRACT_REQUIRED but no Closed Won "
+                        "New Business/Renewal with ContractId for Account %s (check record type DeveloperNames).",
+                        account_id,
+                    )
+                    skip_expansion = True
+                if skip_expansion:
                     mark_processed = False
                 else:
                     total_delta = sum(p[2] for p in pending)
@@ -1488,6 +1569,7 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                         contract_end=contract_end,
                         term_months=term_months,
                         contract_id=contract_id,
+                        amended_contract_id=amended_contract_id,
                     )
                     log.info("Created Opportunity %s total_delta=%s", oid, total_delta)
                     _attach_expansion_quote_and_lines(
