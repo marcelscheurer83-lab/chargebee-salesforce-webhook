@@ -2150,6 +2150,14 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
     company = str(customer.get("company") or "").strip()
     currency = str(sub.get("currency_code") or "USD")
 
+    log.info(
+        "Chargebee webhook received event_id=%s event_type=%s subscription_id=%s customer_id=%s",
+        event_id,
+        event_type,
+        subscription_id,
+        customer_id or "?",
+    )
+
     exact = _addon_exact_ids_from_env()
     items = sub.get("subscription_items") or sub.get("subscription_items_list") or []
     if not isinstance(items, list):
@@ -2258,6 +2266,14 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                 pending.append((key, new_qty, delta, str(ip_id), up))
 
             mark_processed = True
+            if not pending:
+                log.info(
+                    "No expansion Opportunity: no positive seat delta for tracked self-serve lines "
+                    "(event_id=%s subscription_id=%s). Usually state already matches Chargebee qty "
+                    "(recent merge or prior webhook); increase seats again or re-send webhook after a real change.",
+                    event_id,
+                    subscription_id,
+                )
             if pending:
                 sf = _get_salesforce()
                 account_id = _resolve_account_id(sf, customer, customer_id)
