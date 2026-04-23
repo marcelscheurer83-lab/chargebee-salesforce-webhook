@@ -21,10 +21,10 @@ if you prefer fewer API calls. Manual seed is still useful before go-live if sta
 first increase is computed before this merge, so a cold start can still treat the full current qty
 as delta unless you seeded or use a persistent volume with prior quantities.
 
-Products: always creates a Quote on the expansion Opportunity and adds QuoteLineItems (seat delta qty).
-Map SF_QUOTE_MRR_FIELD / SF_QUOTE_ARR_FIELD / SF_QUOTE_ONETIME_FEES_FIELD for header revenue; optional
-SF_QUOTELINEITEM_STATIC_FIELDS_JSON for line-level charge-type fields. After each successful webhook,
-line quantities are synced from the payload, then optionally merged from the Chargebee API (see above).
+Products: creates a Quote on the expansion Opportunity, adds QuoteLineItems (seat delta qty), then
+enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId) so products roll up on the Opp. Optional
+SF_QUOTE_* revenue fields and SF_QUOTELINEITEM_STATIC_FIELDS_JSON are in .env.example. After each
+successful webhook, line quantities are synced from the payload, then optionally merged from Chargebee.
 """
 
 from __future__ import annotations
@@ -856,11 +856,15 @@ def _patch_quote_financials_after_line_items(
         )
 
 
-def _try_set_quote_syncing(sf: Salesforce, quote_id: str) -> None:
+def _try_set_quote_syncing(sf: Salesforce, opp_id: str, quote_id: str) -> None:
     """
-    Standard Salesforce Quote: set IsSyncing so line items sync to Opportunity products.
-    If your org uses a custom checkbox instead, set SF_QUOTE_SYNCING_FIELD (and optional SF_QUOTE_SYNCING_VALUE).
-    Salesforce CPQ (SBQQ__Quote__c) uses a different model — this applies to standard Quote only.
+    Standard Salesforce Quote: turn on sync so QuoteLineItems mirror to OpportunityLineItem on this Opp.
+    Then set Opportunity.SyncedQuoteId to this quote when allowed (UI + rollups treat it as the synced quote).
+
+    Custom checkbox/picklist instead of IsSyncing: SF_QUOTE_SYNCING_FIELD + SF_QUOTE_SYNCING_VALUE.
+    CPQ (SBQQ__Quote__c) uses a different model — this targets standard Quote + Opportunity only.
+
+    Disable Opportunity.SyncedQuoteId patch with SF_QUOTE_SET_OPPORTUNITY_SYNCED_QUOTE_ID=0 if your org rejects it.
     """
     if (sf_cfg("SF_QUOTE_SYNC_TO_OPPORTUNITY", "1") or "").strip().lower() in ("0", "false", "no"):
         return
@@ -874,14 +878,93 @@ def _try_set_quote_syncing(sf: Salesforce, quote_id: str) -> None:
             val = False
         else:
             val = vraw
-        patch: dict[str, Any] = {alt: val}
+        q_patch: dict[str, Any] = {alt: val}
     else:
-        patch = {"IsSyncing": True}
-    try:
-        sf.Quote.update(quote_id, patch)
-        log.info("Quote → Opportunity sync flag set for %s (%s)", quote_id, list(patch.keys()))
-    except Exception as exc:
-        log.warning("Could not set quote sync (%s): %s", patch, exc)
+        q_patch = {"IsSyncing": True}
+
+    quote_sync_ok = False
+    last_q: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            sf.Quote.update(quote_id, q_patch)
+            log.info(
+                "Quote → Opportunity sync enabled on Quote %s (keys=%s)",
+                quote_id,
+                list(q_patch.keys()),
+            )
+            quote_sync_ok = True
+            break
+        except Exception as exc:
+            last_q = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                break
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                break
+            if code != 400:
+                break
+            drop = _fields_to_drop_from_salesforce_400(exc, q_patch)
+            if not drop:
+                break
+            removed = False
+            for f in drop:
+                if f in q_patch:
+                    q_patch.pop(f)
+                    removed = True
+            if not removed or not q_patch:
+                break
+            log.warning("Retrying Quote.update (sync flag) without bad fields: %s", drop)
+
+    if not quote_sync_ok:
+        if last_q:
+            log.warning("Could not set quote sync flag on %s: %s", quote_id, last_q)
+        return
+
+    if (sf_cfg("SF_QUOTE_SET_OPPORTUNITY_SYNCED_QUOTE_ID", "1") or "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return
+
+    o_patch: dict[str, Any] = {"SyncedQuoteId": quote_id}
+    last_o: BaseException | None = None
+    for _attempt in range(8):
+        try:
+            sf.Opportunity.update(opp_id, o_patch)
+            log.info("Opportunity %s SyncedQuoteId set to Quote %s", opp_id, quote_id)
+            return
+        except Exception as exc:
+            last_o = exc
+            status = getattr(exc, "status", None)
+            if status is None:
+                break
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                break
+            if code != 400:
+                break
+            drop = _fields_to_drop_from_salesforce_400(exc, o_patch)
+            if not drop:
+                break
+            removed = False
+            for f in drop:
+                if f in o_patch:
+                    o_patch.pop(f)
+                    removed = True
+            if not removed or not o_patch:
+                break
+            log.warning("Retrying Opportunity.update (SyncedQuoteId) without bad fields: %s", drop)
+
+    if last_o:
+        log.warning(
+            "Could not set Opportunity.SyncedQuoteId (Quote.IsSyncing may still drive line sync). opp=%s err=%s",
+            opp_id,
+            last_o,
+        )
 
 
 def _quote_expiration_date_iso() -> str:
@@ -1157,7 +1240,7 @@ def _attach_expansion_quote_and_lines(
         term_months=term_months,
     )
     _patch_quote_financials_after_line_items(sf, qid, amount=amount)
-    _try_set_quote_syncing(sf, qid)
+    _try_set_quote_syncing(sf, opp_id, qid)
 
 
 def _check_basic_auth() -> bool:
