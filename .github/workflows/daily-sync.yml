@@ -39,6 +39,14 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: |
+          if [ -z "${CHARGEBEE_SITE:-}" ] || [ -z "${CHARGEBEE_API_KEY:-}" ]; then
+            echo "::error::Set repository secrets CHARGEBEE_SITE and CHARGEBEE_API_KEY (Settings → Secrets and variables → Actions). They are empty in this run."
+            exit 1
+          fi
+          if [ -z "${GOOGLE_SHEET_ID:-}" ] || [ -z "${GOOGLE_CREDENTIALS_JSON:-}" ]; then
+            echo "::error::Set repository secrets GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS_JSON (full service account JSON)."
+            exit 1
+          fi
           mkdir -p .env.d
           echo "CHARGEBEE_SITE=$CHARGEBEE_SITE" >> .env
           echo "CHARGEBEE_API_KEY=$CHARGEBEE_API_KEY" >> .env
