@@ -28,6 +28,10 @@ subscription lines from the Chargebee API in a background thread by default
 subscription_created (new subscription) refreshes baseline only by default — it does not create an
 expansion for the initial quantities (set WEBHOOK_ALLOW_EXPANSION_ON_SUBSCRIPTION_CREATED=1 to change).
 
+Quote/Opp revenue uses a monthly (MRR) unit price: Chargebee ``unit_price`` is divided by the line's
+billing cycle length in months (yearly ÷12, every 6 months ÷6, every 3 months ÷3; monthly ÷1) using
+``billing_period`` / ``billing_period_unit`` on the line or subscription payload.
+
 Products: creates a Quote on the expansion Opportunity, adds QuoteLineItems (seat delta qty), then
 enables Quote→Opportunity sync (IsSyncing + SyncedQuoteId). Expansion can set Amended_Contract__c from
 the latest Closed Won NB/Renewal Opportunity’s ContractId (SF_OPP_AMENDED_CONTRACT_*). Optionally
@@ -68,6 +72,7 @@ from chargebee_client import (
     _crm_addon_line_matches,
     infer_prior_self_serve_qty_from_subscription_changed_events,
     self_service_line_state_key,
+    subscription_item_billing_cycle_months,
     subscription_items_from_webhook_subscription,
     subscription_line_dicts_from_chargebee_retrieve,
 )
@@ -991,6 +996,32 @@ def _unit_price_major(si: dict[str, Any], currency_code: str) -> float | None:
     if cur in zero_dec:
         return float(cents)
     return cents / 100.0
+
+
+def _monthly_mrr_unit_price(
+    si: dict[str, Any],
+    currency_code: str,
+    subscription: dict[str, Any] | None,
+) -> float | None:
+    """
+    Chargebee line ``unit_price`` is for one billing cycle; Salesforce Quote/Opp expect a monthly unit.
+    """
+    period_price = _unit_price_major(si, currency_code)
+    if period_price is None:
+        return None
+    months = subscription_item_billing_cycle_months(si, subscription)
+    if months <= 0:
+        return period_price
+    monthly = period_price / months
+    if months != 1.0:
+        log.info(
+            "Chargebee → SF monthly unit: item_price_id=%s cycle_months=%s period_price=%s monthly_unit=%s",
+            si.get("item_price_id"),
+            months,
+            period_price,
+            monthly,
+        )
+    return monthly
 
 
 def _create_expansion_opportunity(
@@ -2322,13 +2353,15 @@ def _handle_subscription_event(payload: dict[str, Any]) -> None:
                     continue
 
                 delta = new_qty - old_qty
-                up = _unit_price_major(si, currency)
+                up = _monthly_mrr_unit_price(si, currency, sub if isinstance(sub, dict) else None)
                 log.info(
-                    "Self-serve line item_price_id=%s stored_qty=%s chargebee_qty=%s delta_qty=%s",
+                    "Self-serve line item_price_id=%s stored_qty=%s chargebee_qty=%s delta_qty=%s "
+                    "monthly_unit_price=%s",
                     ip_id,
                     old_qty,
                     new_qty,
                     delta,
+                    up,
                 )
                 pending.append((key, new_qty, delta, str(ip_id), up))
 

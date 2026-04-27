@@ -45,6 +45,53 @@ def _addon_exact_ids_from_env() -> frozenset[str] | None:
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
 
+def subscription_item_billing_cycle_months(
+    line: dict[str, Any],
+    subscription: dict[str, Any] | None = None,
+) -> float:
+    """
+    Months in one Chargebee billing cycle for this line's unit price (price applies to the full cycle).
+
+    Examples: yearly → 12, every 6 months → 6, every 3 months → 3, monthly → 1.
+    Uses line ``billing_period`` / ``billing_period_unit`` when present, else subscription-level fields,
+    else ``1.0`` (treat unit price as already monthly).
+    """
+
+    def _from_period_and_unit(period: Any, unit: Any) -> float | None:
+        if period is None and (unit is None or str(unit).strip() == ""):
+            return None
+        try:
+            p = int(period)
+        except (TypeError, ValueError):
+            return None
+        if p < 1:
+            return None
+        u = (str(unit) if unit is not None else "").strip().lower()
+        if u == "month":
+            return float(p)
+        if u == "year":
+            return float(p) * 12.0
+        if u == "week":
+            return float(p) * 12.0 / 52.0
+        if u == "day":
+            return float(p) * 12.0 / 365.25
+        return None
+
+    bp = line.get("billing_period")
+    bpu = line.get("billing_period_unit")
+    m = _from_period_and_unit(bp, bpu)
+    if m is not None and m > 0:
+        return m
+    if subscription and isinstance(subscription, dict):
+        m = _from_period_and_unit(
+            subscription.get("billing_period"),
+            subscription.get("billing_period_unit"),
+        )
+        if m is not None and m > 0:
+            return m
+    return 1.0
+
+
 def subscription_line_dicts_from_chargebee_retrieve(subscription_id: str) -> list[dict[str, Any]] | None:
     """
     Current subscription line rows from Chargebee API (source of truth for quantities).
@@ -85,6 +132,25 @@ def subscription_line_dicts_from_chargebee_retrieve(subscription_id: str) -> lis
         dec = getattr(si, "unit_price_in_decimal", None)
         if dec is not None and str(dec).strip() != "":
             row["unit_price_in_decimal"] = str(dec).strip()
+        bp = getattr(si, "billing_period", None)
+        bpu = getattr(si, "billing_period_unit", None)
+        if bp is not None:
+            try:
+                row["billing_period"] = int(bp)
+            except (TypeError, ValueError):
+                pass
+        if bpu is not None and str(bpu).strip():
+            row["billing_period_unit"] = str(bpu).strip().lower()
+        if row.get("billing_period") is None or not row.get("billing_period_unit"):
+            sbp = getattr(sub_obj, "billing_period", None)
+            sbpu = getattr(sub_obj, "billing_period_unit", None)
+            if row.get("billing_period") is None and sbp is not None:
+                try:
+                    row["billing_period"] = int(sbp)
+                except (TypeError, ValueError):
+                    pass
+            if not row.get("billing_period_unit") and sbpu is not None and str(sbpu).strip():
+                row["billing_period_unit"] = str(sbpu).strip().lower()
         out.append(row)
     return out
 
