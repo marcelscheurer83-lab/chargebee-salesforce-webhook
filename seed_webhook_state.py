@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -61,6 +62,18 @@ def merge_chargebee_line_quantities_into_dict(lines: dict[str, int]) -> int:
     return len(from_api)
 
 
+def merge_chargebee_into_state_dict(state: dict[str, Any]) -> int:
+    """
+    Merge Chargebee self-serve line quantities into an in-memory state dict (in-place).
+    Preserves processed_event_ids. Returns count of subscription lines from the API.
+    """
+    state.setdefault("processed_event_ids", [])
+    merged = dict(state.get("line_quantities") or {})
+    n = merge_chargebee_line_quantities_into_dict(merged)
+    state["line_quantities"] = merged
+    return n
+
+
 def merge_chargebee_into_state_file(state_path: Path) -> int:
     """
     Pull active subscription self-serve quantities from Chargebee and merge into state_path.
@@ -74,10 +87,7 @@ def merge_chargebee_into_state_file(state_path: Path) -> int:
     else:
         state = {}
 
-    state.setdefault("processed_event_ids", [])
-    merged = dict(state.get("line_quantities") or {})
-    n = merge_chargebee_line_quantities_into_dict(merged)
-    state["line_quantities"] = merged
+    n = merge_chargebee_into_state_dict(state)
 
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_path.with_suffix(".tmp")
