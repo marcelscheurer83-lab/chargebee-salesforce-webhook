@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY webhook_app.py chargebee_client.py seed_webhook_state.py sf_config.py ./
+COPY webhook_app.py chargebee_client.py seed_webhook_state.py webhook_state_store.py sf_config.py ./
 COPY salesforce_field_map.example.json ./
 
 ENV PORT=8080
