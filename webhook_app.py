@@ -11,9 +11,9 @@ Chargebee: Settings → Configure Chargebee → Webhooks
   - Events: subscription_changed (optionally subscription_created to learn baselines)
   - HTTP Basic Auth: match WEBHOOK_BASIC_USER / WEBHOOK_BASIC_PASS
 
-State: default is JSON file WEBHOOK_STATE_PATH (use a volume if the container is ephemeral).
-Alternatively set WEBHOOK_STATE_BACKEND=postgres with DATABASE_URL (or WEBHOOK_STATE_DATABASE_URL)
-so baselines and processed_event_ids live in PostgreSQL (table webhook_app_state).
+State file WEBHOOK_STATE_PATH defaults to ./webhook_state.json inside the container; use a volume
+if you need quantities to survive redeploys (otherwise stored_qty resets and the next increase can
+look like a full delta from zero).
 
 Delta logic: for each self-serve line key ``subscription_id|item_price_id``, ``stored_qty`` is the
 last known quantity in ``line_quantities``. The webhook payload supplies ``chargebee_qty``; a
@@ -77,10 +77,9 @@ from chargebee_client import (
     subscription_line_dicts_from_chargebee_retrieve,
 )
 from seed_webhook_state import (
-    merge_chargebee_into_state_dict,
+    merge_chargebee_into_state_file,
     merge_chargebee_line_quantities_into_dict,
 )
-from webhook_state_store import build_webhook_state_store
 from sf_config import init_sf_config, sf_cfg
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -92,16 +91,12 @@ log = logging.getLogger("webhook_app")
 app = Flask(__name__)
 
 _state_lock = threading.Lock()
-_DEFAULT_STATE_FILE = Path(__file__).resolve().parent / "webhook_state.json"
-_state_store, _WEBHOOK_STATE_BACKEND = build_webhook_state_store(_DEFAULT_STATE_FILE)
-_STATE_PATH = Path(os.getenv("WEBHOOK_STATE_PATH", str(_DEFAULT_STATE_FILE)))
+_STATE_PATH = Path(
+    os.getenv("WEBHOOK_STATE_PATH", str(Path(__file__).resolve().parent / "webhook_state.json"))
+)
 
 log.info("Expansion pricing: Quote + QuoteLineItems (standard); quote lines use seat delta quantity")
-log.info(
-    "Webhook state backend=%s path=%s (path used when backend=file)",
-    _WEBHOOK_STATE_BACKEND,
-    _STATE_PATH,
-)
+log.info("Webhook state file: %s", _STATE_PATH)
 
 
 def _merge_chargebee_state_after_webhook_enabled() -> bool:
@@ -211,11 +206,19 @@ def _sync_self_service_quantities_from_subscription(
 
 
 def _load_state() -> dict[str, Any]:
-    return _state_store.load()
+    if not _STATE_PATH.exists():
+        return {"processed_event_ids": [], "line_quantities": {}}
+    try:
+        return json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"processed_event_ids": [], "line_quantities": {}}
 
 
 def _save_state(state: dict[str, Any]) -> None:
-    _state_store.save(state)
+    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=0), encoding="utf-8")
+    tmp.replace(_STATE_PATH)
 
 
 def _trim_processed_ids(ids: list[str], max_keep: int = 2000) -> list[str]:
@@ -2545,9 +2548,7 @@ def admin_seed_state():
         return jsonify({"error": "unauthorized"}), 401
     try:
         with _state_lock:
-            st = _load_state()
-            n = merge_chargebee_into_state_dict(st)
-            _save_state(st)
+            n = merge_chargebee_into_state_file(_STATE_PATH)
     except ValueError as e:
         log.warning("Seed failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
